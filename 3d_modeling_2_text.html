@@ -1,0 +1,2639 @@
+<!doctype html>
+<html lang="ko" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VocaCAD Studio — 구술 3D 모델링 스튜디오</title>
+    <meta
+      name="description"
+      content="구술(음성)과 자연어로 3D 모델을 생성·편집하고 GLB로 내보내는 3D 스튜디오"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+      };
+    </script>
+    <style>
+      :root {
+        --font-display: 'Plus Jakarta Sans', 'Noto Sans KR', sans-serif;
+        --font-sans: 'Noto Sans KR', 'Plus Jakarta Sans', sans-serif;
+        --font-mono: 'JetBrains Mono', monospace;
+      }
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        font-family: var(--font-sans);
+      }
+      .font-display {
+        font-family: var(--font-display);
+      }
+      .font-mono-tabular {
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
+      }
+      .dock-scroll::-webkit-scrollbar {
+        width: 5px;
+        height: 5px;
+      }
+      .dock-scroll::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .dock-scroll::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.35);
+        border-radius: 9999px;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.0.1",
+          "react-dom/client": "https://esm.sh/react-dom@19.0.1/client",
+          "htm": "https://esm.sh/htm@3.1.1",
+          "three": "https://esm.sh/three@0.187.0",
+          "three/addons/": "https://esm.sh/three@0.187.0/examples/jsm/",
+          "lucide-react": "https://esm.sh/lucide-react@0.546.0?external=react"
+        }
+      }
+    </script>
+  </head>
+  <body class="bg-[#0e1116] text-slate-100 antialiased selection:bg-sky-500/30">
+    <div id="root"></div>
+
+    <script type="module">
+      import React, {
+        forwardRef,
+        useCallback,
+        useEffect,
+        useImperativeHandle,
+        useMemo,
+        useRef,
+        useState,
+      } from 'react';
+      import { createRoot } from 'react-dom/client';
+      import htm from 'htm';
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+      import { TransformControls } from 'three/addons/controls/TransformControls.js';
+      import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+      import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+      import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+      import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+      import {
+        ArrowDownToLine,
+        Box,
+        Camera,
+        ChevronDown,
+        ChevronUp,
+        Copy,
+        Download,
+        Eye,
+        EyeOff,
+        FolderOpen,
+        History,
+        Layers,
+        Maximize2,
+        Mic,
+        MicOff,
+        Move,
+        Plus,
+        RotateCw,
+        Search,
+        Send,
+        Sliders,
+        Sparkles,
+        Trash2,
+        Upload,
+      } from 'lucide-react';
+
+      const html = htm.bind(React.createElement);
+      const API_BASE = ''; // 필요 시 백엔드 URL 지정 (예: 'https://your-server.example.com')
+
+      const DEG2RAD = Math.PI / 180;
+      const RAD2DEG = 180 / Math.PI;
+
+      // =========================================================================
+      // 1. IndexedDB Storage (Projects + Imported 3D Assets)
+      // =========================================================================
+      const DB_NAME = 'vocacad_studio_db';
+      const DB_VERSION = 1;
+      const PROJECTS_STORE = 'projects';
+      const ASSETS_STORE = 'assets';
+      const assetMemoryCache = new Map();
+
+      function openDB() {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open(DB_NAME, DB_VERSION);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(PROJECTS_STORE)) {
+              const store = db.createObjectStore(PROJECTS_STORE, { keyPath: 'id' });
+              store.createIndex('updatedAt', 'updatedAt', { unique: false });
+            }
+            if (!db.objectStoreNames.contains(ASSETS_STORE)) {
+              db.createObjectStore(ASSETS_STORE, { keyPath: 'id' });
+            }
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      }
+
+      async function listProjects() {
+        try {
+          const db = await openDB();
+          return await new Promise((resolve, reject) => {
+            const tx = db.transaction(PROJECTS_STORE, 'readonly');
+            const req = tx.objectStore(PROJECTS_STORE).getAll();
+            req.onsuccess = () => {
+              const items = req.result || [];
+              items.sort((a, b) => b.updatedAt - a.updatedAt);
+              resolve(items);
+            };
+            req.onerror = () => reject(req.error);
+          });
+        } catch {
+          return [];
+        }
+      }
+
+      async function saveStoredProject(record) {
+        const db = await openDB();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(PROJECTS_STORE, 'readwrite');
+          tx.objectStore(PROJECTS_STORE).put(record);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      }
+
+      async function deleteStoredProject(id) {
+        const db = await openDB();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(PROJECTS_STORE, 'readwrite');
+          tx.objectStore(PROJECTS_STORE).delete(id);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      }
+
+      async function saveAssetRecord(asset) {
+        assetMemoryCache.set(asset.id, asset);
+        const db = await openDB();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(ASSETS_STORE, 'readwrite');
+          tx.objectStore(ASSETS_STORE).put(asset);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      }
+
+      async function getAssetRecord(id) {
+        if (assetMemoryCache.has(id)) return assetMemoryCache.get(id);
+        try {
+          const db = await openDB();
+          const record = await new Promise((resolve, reject) => {
+            const tx = db.transaction(ASSETS_STORE, 'readonly');
+            const req = tx.objectStore(ASSETS_STORE).get(id);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+          });
+          if (record) assetMemoryCache.set(id, record);
+          return record;
+        } catch {
+          return null;
+        }
+      }
+
+      // =========================================================================
+      // 2. Procedural Canvas Textures & 3D Geometry / Material Builders
+      // =========================================================================
+      let cachedWoodAlbedo = null;
+      let cachedBrushedRoughness = null;
+      let cachedContactShadow = null;
+
+      function getWoodAlbedoTexture(maxAnisotropy = 4) {
+        if (cachedWoodAlbedo) return cachedWoodAlbedo;
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#d4a373';
+          ctx.fillRect(0, 0, 512, 512);
+          for (let y = 0; y < 512; y += 2) {
+            const wave = Math.sin(y * 0.04) * 14 + Math.cos(y * 0.013) * 8;
+            const tone = 188 + Math.round(Math.sin((y + wave) * 0.11) * 18);
+            ctx.fillStyle = `rgb(${tone}, ${Math.round(tone * 0.72)}, ${Math.round(tone * 0.46)})`;
+            ctx.fillRect(0, y, 512, 2);
+          }
+          ctx.globalAlpha = 0.08;
+          for (let i = 0; i < 650; i++) {
+            const x = (i * 73) % 512;
+            const y = (i * 197) % 512;
+            ctx.fillStyle = i % 2 === 0 ? '#5c3a21' : '#f3d5b5';
+            ctx.fillRect(x, y, 28 + (i % 40), 1);
+          }
+        }
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(2, 2);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = maxAnisotropy;
+        cachedWoodAlbedo = tex;
+        return tex;
+      }
+
+      function getBrushedRoughnessTexture(maxAnisotropy = 4) {
+        if (cachedBrushedRoughness) return cachedBrushedRoughness;
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#505050';
+          ctx.fillRect(0, 0, 256, 256);
+          for (let i = 0; i < 900; i++) {
+            const y = (i * 37) % 256;
+            const v = 55 + ((i * 19) % 70);
+            ctx.fillStyle = `rgb(${v},${v},${v})`;
+            ctx.fillRect(0, y, 256, 1);
+          }
+        }
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(3, 3);
+        tex.colorSpace = THREE.NoColorSpace;
+        tex.anisotropy = maxAnisotropy;
+        cachedBrushedRoughness = tex;
+        return tex;
+      }
+
+      function getContactShadowTexture() {
+        if (cachedContactShadow) return cachedContactShadow;
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          const grad = ctx.createRadialGradient(128, 128, 10, 128, 128, 124);
+          grad.addColorStop(0, 'rgba(0, 0, 0, 0.55)');
+          grad.addColorStop(0.45, 'rgba(0, 0, 0, 0.22)');
+          grad.addColorStop(1, 'rgba(0, 0, 0, 0.0)');
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, 256, 256);
+        }
+        const tex = new THREE.CanvasTexture(canvas);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        cachedContactShadow = tex;
+        return tex;
+      }
+
+      function createPBRMaterial(spec, isSoftwareGl, maxAnisotropy = 4) {
+        const baseColor = new THREE.Color(spec?.color || '#94a3b8');
+        const finish = spec?.finish || 'satin';
+
+        if (finish === 'glass') {
+          return new THREE.MeshPhysicalMaterial({
+            color: baseColor,
+            roughness: spec.roughness ?? 0.06,
+            metalness: spec.metalness ?? 0.0,
+            ior: 1.52,
+            thickness: 0.6,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.05,
+            transmission: isSoftwareGl ? 0 : 0.9,
+            transparent: true,
+            opacity: isSoftwareGl ? Math.min(spec.opacity ?? 0.42, 0.5) : spec.opacity ?? 1.0,
+            depthWrite: !isSoftwareGl,
+          });
+        }
+        if (finish === 'brushed_metal') {
+          return new THREE.MeshPhysicalMaterial({
+            color: baseColor,
+            metalness: spec.metalness ?? 0.94,
+            roughness: spec.roughness ?? 0.26,
+            roughnessMap: getBrushedRoughnessTexture(maxAnisotropy),
+            anisotropy: 0.85,
+            anisotropyRotation: 0.2,
+            transparent: (spec.opacity ?? 1) < 1,
+            opacity: spec.opacity ?? 1,
+          });
+        }
+        if (finish === 'ceramic') {
+          return new THREE.MeshPhysicalMaterial({
+            color: baseColor,
+            metalness: spec.metalness ?? 0.0,
+            roughness: spec.roughness ?? 0.22,
+            clearcoat: 0.92,
+            clearcoatRoughness: 0.08,
+            transparent: (spec.opacity ?? 1) < 1,
+            opacity: spec.opacity ?? 1,
+          });
+        }
+        if (finish === 'wood') {
+          return new THREE.MeshStandardMaterial({
+            color: baseColor,
+            map: getWoodAlbedoTexture(maxAnisotropy),
+            roughness: spec.roughness ?? 0.68,
+            metalness: spec.metalness ?? 0.02,
+            transparent: (spec.opacity ?? 1) < 1,
+            opacity: spec.opacity ?? 1,
+          });
+        }
+        if (finish === 'emissive') {
+          const emissiveCol = new THREE.Color(spec.emissiveColor || spec.color || '#fbbf24');
+          return new THREE.MeshStandardMaterial({
+            color: baseColor,
+            emissive: emissiveCol,
+            emissiveIntensity: spec.emissiveIntensity ?? 1.4,
+            roughness: spec.roughness ?? 0.3,
+            metalness: spec.metalness ?? 0.05,
+            transparent: (spec.opacity ?? 1) < 1,
+            opacity: spec.opacity ?? 1,
+          });
+        }
+
+        const presetMap = {
+          matte: { roughness: 0.88, metalness: 0.03 },
+          satin: { roughness: 0.45, metalness: 0.08 },
+          glossy: { roughness: 0.14, metalness: 0.12 },
+          metallic: { roughness: 0.2, metalness: 0.92 },
+        };
+        const preset = presetMap[finish] ?? presetMap.satin;
+
+        return new THREE.MeshStandardMaterial({
+          color: baseColor,
+          roughness: spec?.roughness ?? preset.roughness,
+          metalness: spec?.metalness ?? preset.metalness,
+          emissive: spec?.emissiveColor
+            ? new THREE.Color(spec.emissiveColor)
+            : new THREE.Color(0x000000),
+          emissiveIntensity: spec?.emissiveIntensity ?? 0,
+          transparent: (spec?.opacity ?? 1) < 1,
+          opacity: spec?.opacity ?? 1,
+        });
+      }
+
+      function createBufferGeometry(shape, params = {}) {
+        switch (shape) {
+          case 'box':
+            return new THREE.BoxGeometry(
+              Math.max(0.02, params.width ?? 1),
+              Math.max(0.02, params.height ?? 1),
+              Math.max(0.02, params.depth ?? 1),
+              2,
+              2,
+              2
+            );
+          case 'sphere':
+            return new THREE.SphereGeometry(
+              Math.max(0.02, params.radius ?? 0.6),
+              params.radialSegments ?? 36,
+              28
+            );
+          case 'cylinder':
+            return new THREE.CylinderGeometry(
+              Math.max(0, params.radiusTop ?? params.radius ?? 0.5),
+              Math.max(0, params.radiusBottom ?? params.radius ?? 0.5),
+              Math.max(0.02, params.height ?? 1.2),
+              params.radialSegments ?? 36
+            );
+          case 'cone':
+            return new THREE.ConeGeometry(
+              Math.max(0.02, params.radius ?? 0.6),
+              Math.max(0.02, params.height ?? 1.2),
+              params.radialSegments ?? 36
+            );
+          case 'torus':
+            return new THREE.TorusGeometry(
+              Math.max(0.05, params.radius ?? 0.6),
+              Math.max(0.015, params.tube ?? 0.18),
+              20,
+              64
+            );
+          case 'torusKnot':
+            return new THREE.TorusKnotGeometry(
+              Math.max(0.05, params.radius ?? 0.55),
+              Math.max(0.015, params.tube ?? 0.16),
+              96,
+              20,
+              params.p ?? 2,
+              params.q ?? 3
+            );
+          case 'capsule':
+            return new THREE.CapsuleGeometry(
+              Math.max(0.02, params.radius ?? 0.35),
+              Math.max(0.02, params.length ?? 0.8),
+              8,
+              24
+            );
+          case 'dodecahedron':
+            return new THREE.DodecahedronGeometry(
+              Math.max(0.02, params.radius ?? 0.65),
+              params.detail ?? 0
+            );
+          case 'octahedron':
+            return new THREE.OctahedronGeometry(
+              Math.max(0.02, params.radius ?? 0.65),
+              params.detail ?? 0
+            );
+          case 'ring': {
+            const geo = new THREE.RingGeometry(
+              Math.max(0.01, params.innerRadius ?? 0.35),
+              Math.max(0.05, params.outerRadius ?? 0.7),
+              params.radialSegments ?? 48
+            );
+            geo.rotateX(-Math.PI / 2);
+            return geo;
+          }
+          case 'plane': {
+            const geo = new THREE.PlaneGeometry(
+              Math.max(0.05, params.width ?? 2),
+              Math.max(0.05, params.depth ?? params.height ?? 2)
+            );
+            geo.rotateX(-Math.PI / 2);
+            return geo;
+          }
+          case 'lathe': {
+            const rawPoints =
+              Array.isArray(params.lathePoints) && params.lathePoints.length >= 2
+                ? params.lathePoints
+                : [
+                    [0, 0],
+                    [0.4, 0],
+                    [0.52, 0.4],
+                    [0.35, 0.9],
+                    [0.42, 1.2],
+                    [0, 1.2],
+                  ];
+            const vecPoints = rawPoints.map(
+              ([r, y]) => new THREE.Vector2(Math.max(0, Number(r) || 0), Number(y) || 0)
+            );
+            const geo = new THREE.LatheGeometry(vecPoints, params.radialSegments ?? 48);
+            geo.computeVertexNormals();
+            return geo;
+          }
+          case 'extrude': {
+            const rawPts =
+              Array.isArray(params.shapePoints) && params.shapePoints.length >= 3
+                ? params.shapePoints
+                : [
+                    [-0.5, -0.5],
+                    [0.5, -0.5],
+                    [0.5, 0.5],
+                    [-0.5, 0.5],
+                  ];
+            const shape2d = new THREE.Shape();
+            shape2d.moveTo(Number(rawPts[0][0]) || 0, Number(rawPts[0][1]) || 0);
+            for (let i = 1; i < rawPts.length; i++) {
+              shape2d.lineTo(Number(rawPts[i][0]) || 0, Number(rawPts[i][1]) || 0);
+            }
+            shape2d.closePath();
+            const geo = new THREE.ExtrudeGeometry(shape2d, {
+              depth: Math.max(0.02, params.depth ?? 0.3),
+              bevelEnabled: true,
+              bevelThickness: params.bevelThickness ?? 0.04,
+              bevelSize: params.bevelSize ?? 0.04,
+              bevelSegments: 3,
+            });
+            geo.center();
+            geo.computeVertexNormals();
+            return geo;
+          }
+          case 'tube': {
+            const rawCurve =
+              Array.isArray(params.curvePoints) && params.curvePoints.length >= 2
+                ? params.curvePoints
+                : [
+                    [0, 0, 0],
+                    [0.4, 0.4, 0],
+                    [0.4, 0.9, 0],
+                    [0, 1.1, 0],
+                  ];
+            const vectors = rawCurve.map(
+              ([x, y, z]) => new THREE.Vector3(Number(x) || 0, Number(y) || 0, Number(z) || 0)
+            );
+            const curve = new THREE.CatmullRomCurve3(vectors, Boolean(params.closed));
+            const geo = new THREE.TubeGeometry(
+              curve,
+              48,
+              Math.max(0.01, params.radius ?? params.tube ?? 0.08),
+              16,
+              Boolean(params.closed)
+            );
+            geo.computeVertexNormals();
+            return geo;
+          }
+          default:
+            return new THREE.BoxGeometry(1, 1, 1);
+        }
+      }
+
+      function buildSceneObject(spec, isSoftwareGl, maxAnisotropy = 4) {
+        let root;
+        if (spec.shape === 'imported') {
+          const group = new THREE.Group();
+          group.name = spec.name;
+          group.userData.isImported = true;
+          root = group;
+        } else if (spec.shape === 'group' && Array.isArray(spec.parts) && spec.parts.length > 0) {
+          const group = new THREE.Group();
+          group.name = spec.name;
+          for (const part of spec.parts) {
+            const geo = createBufferGeometry(part.shape, part.params);
+            const mat = createPBRMaterial(part.material, isSoftwareGl, maxAnisotropy);
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.name = part.name;
+            mesh.position.set(part.position[0], part.position[1], part.position[2]);
+            const rot = part.rotationDeg ?? [0, 0, 0];
+            mesh.rotation.set(rot[0] * DEG2RAD, rot[1] * DEG2RAD, rot[2] * DEG2RAD);
+            const scl = part.scale ?? [1, 1, 1];
+            mesh.scale.set(scl[0], scl[1], scl[2]);
+            mesh.castShadow = !isSoftwareGl;
+            mesh.receiveShadow = !isSoftwareGl;
+            mesh.userData.rootObjectId = spec.id;
+            group.add(mesh);
+          }
+          root = group;
+        } else {
+          const shape = spec.shape === 'group' ? 'box' : spec.shape;
+          const geo = createBufferGeometry(shape, spec.params);
+          const mat = createPBRMaterial(spec.material, isSoftwareGl, maxAnisotropy);
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.name = spec.name;
+          mesh.castShadow = !isSoftwareGl;
+          mesh.receiveShadow = !isSoftwareGl;
+          mesh.userData.rootObjectId = spec.id;
+          root = mesh;
+        }
+
+        root.userData.objectId = spec.id;
+        root.position.set(spec.position[0], spec.position[1], spec.position[2]);
+        root.rotation.set(
+          spec.rotationDeg[0] * DEG2RAD,
+          spec.rotationDeg[1] * DEG2RAD,
+          spec.rotationDeg[2] * DEG2RAD
+        );
+        root.scale.set(spec.scale[0], spec.scale[1], spec.scale[2]);
+        root.visible = spec.visible !== false;
+
+        if (spec.snapToGround && spec.shape !== 'imported') {
+          root.updateMatrixWorld(true);
+          const box = new THREE.Box3().setFromObject(root);
+          if (Number.isFinite(box.min.y)) {
+            root.position.y -= box.min.y;
+            spec.position = [
+              root.position.x,
+              Number(root.position.y.toFixed(3)),
+              root.position.z,
+            ];
+          }
+        }
+        return root;
+      }
+
+      function disposeThreeObject(obj) {
+        obj.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry.dispose();
+            if (Array.isArray(child.material)) {
+              child.material.forEach((m) => m.dispose());
+            } else if (child.material) {
+              child.material.dispose();
+            }
+          }
+        });
+      }
+
+      function createStarterSceneObjects() {
+        return [
+          {
+            id: 'obj_lamp_starter',
+            name: '아치형 브라스 데스크 램프',
+            shape: 'group',
+            position: [-0.85, 0, 0.1],
+            rotationDeg: [0, 22, 0],
+            scale: [1, 1, 1],
+            material: { color: '#d4af37', finish: 'brushed_metal' },
+            snapToGround: true,
+            parts: [
+              {
+                name: '대리석 베이스',
+                shape: 'cylinder',
+                params: { radiusTop: 0.42, radiusBottom: 0.46, height: 0.12, radialSegments: 48 },
+                position: [0, 0.06, 0],
+                material: { color: '#1e293b', finish: 'ceramic' },
+              },
+              {
+                name: '황동 칼라',
+                shape: 'cylinder',
+                params: { radiusTop: 0.08, radiusBottom: 0.11, height: 0.08, radialSegments: 32 },
+                position: [0, 0.15, 0],
+                material: { color: '#d9a441', finish: 'brushed_metal' },
+              },
+              {
+                name: '아치형 스템',
+                shape: 'tube',
+                params: {
+                  curvePoints: [
+                    [0, 0.18, 0],
+                    [-0.12, 0.95, 0],
+                    [0.05, 1.65, 0],
+                    [0.52, 1.72, 0],
+                    [0.72, 1.48, 0],
+                  ],
+                  radius: 0.035,
+                },
+                position: [0, 0, 0],
+                material: { color: '#d9a441', finish: 'brushed_metal' },
+              },
+              {
+                name: '메탈 갓',
+                shape: 'lathe',
+                params: {
+                  lathePoints: [
+                    [0.04, 0.28],
+                    [0.14, 0.26],
+                    [0.34, 0.08],
+                    [0.38, 0.0],
+                    [0.36, 0.0],
+                    [0.12, 0.23],
+                    [0.03, 0.25],
+                  ],
+                  radialSegments: 48,
+                },
+                position: [0.72, 1.24, 0],
+                material: { color: '#1e293b', finish: 'satin' },
+              },
+              {
+                name: '따뜻한 디퓨저 전구',
+                shape: 'sphere',
+                params: { radius: 0.1, radialSegments: 24 },
+                position: [0.72, 1.28, 0],
+                material: {
+                  color: '#fef3c7',
+                  finish: 'emissive',
+                  emissiveColor: '#fbbf24',
+                  emissiveIntensity: 1.6,
+                },
+              },
+            ],
+          },
+          {
+            id: 'obj_vase_starter',
+            name: '코발트 도자기 화병',
+            shape: 'group',
+            position: [0.85, 0, -0.15],
+            rotationDeg: [0, 0, 0],
+            scale: [1, 1, 1],
+            material: { color: '#2563eb', finish: 'ceramic' },
+            snapToGround: true,
+            parts: [
+              {
+                name: '화병 몸체',
+                shape: 'lathe',
+                params: {
+                  lathePoints: [
+                    [0, 0],
+                    [0.24, 0],
+                    [0.38, 0.35],
+                    [0.42, 0.65],
+                    [0.22, 1.05],
+                    [0.17, 1.25],
+                    [0.23, 1.38],
+                    [0.2, 1.38],
+                    [0.14, 1.24],
+                    [0, 1.24],
+                  ],
+                  radialSegments: 48,
+                },
+                position: [0, 0, 0],
+                material: { color: '#1d4ed8', finish: 'ceramic' },
+              },
+              {
+                name: '황동 림 링',
+                shape: 'torus',
+                params: { radius: 0.215, tube: 0.018 },
+                position: [0, 1.37, 0],
+                rotationDeg: [90, 0, 0],
+                material: { color: '#e2b857', finish: 'metallic' },
+              },
+              {
+                name: '원목 받침 트레이',
+                shape: 'cylinder',
+                params: { radiusTop: 0.44, radiusBottom: 0.4, height: 0.06, radialSegments: 40 },
+                position: [0, 0.03, 0],
+                material: { color: '#a47148', finish: 'wood' },
+              },
+            ],
+          },
+        ];
+      }
+
+      // =========================================================================
+      // 3. Imported 3D File Loader (GLB / GLTF / OBJ / STL)
+      // =========================================================================
+      const gltfLoader = new GLTFLoader();
+      const objLoader = new OBJLoader();
+      const stlLoader = new STLLoader();
+
+      async function parseImportedModel(
+        data,
+        format,
+        objectId,
+        isSoftwareGl,
+        maxAnisotropy,
+        overrideMaterial,
+        applyOverride = false
+      ) {
+        let loadedObject;
+        if (format === 'glb' || format === 'gltf') {
+          const gltf = await new Promise((resolve, reject) => {
+            if (format === 'gltf') {
+              gltfLoader.parse(new TextDecoder().decode(data), '', resolve, reject);
+            } else {
+              gltfLoader.parse(data, '', resolve, reject);
+            }
+          });
+          loadedObject = gltf.scene;
+        } else if (format === 'obj') {
+          loadedObject = objLoader.parse(new TextDecoder().decode(data));
+          loadedObject.traverse((child) => {
+            if (child instanceof THREE.Mesh && !child.material) {
+              child.material = createPBRMaterial(
+                overrideMaterial || { color: '#cbd5e1', finish: 'satin' },
+                isSoftwareGl,
+                maxAnisotropy
+              );
+            }
+          });
+        } else if (format === 'stl') {
+          const geometry = stlLoader.parse(data);
+          geometry.computeVertexNormals();
+          const mat = createPBRMaterial(
+            overrideMaterial || { color: '#94a3b8', finish: 'satin' },
+            isSoftwareGl,
+            maxAnisotropy
+          );
+          loadedObject = new THREE.Mesh(geometry, mat);
+        } else {
+          throw new Error(`지원하지 않는 3D 파일 형식: ${format}`);
+        }
+
+        loadedObject.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(loadedObject);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const normScale = maxDim > 0.0001 ? 1.8 / maxDim : 1;
+
+        const pivot = new THREE.Group();
+        loadedObject.scale.multiplyScalar(normScale);
+        loadedObject.position.set(
+          -center.x * normScale,
+          -box.min.y * normScale,
+          -center.z * normScale
+        );
+        pivot.add(loadedObject);
+
+        pivot.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.castShadow = !isSoftwareGl;
+            child.receiveShadow = !isSoftwareGl;
+            child.userData.rootObjectId = objectId;
+            if ((applyOverride || format === 'stl') && overrideMaterial) {
+              child.material = createPBRMaterial(overrideMaterial, isSoftwareGl, maxAnisotropy);
+            } else if (child.material) {
+              const mats = Array.isArray(child.material) ? child.material : [child.material];
+              for (const mat of mats) {
+                if (
+                  mat instanceof THREE.MeshStandardMaterial ||
+                  mat instanceof THREE.MeshPhysicalMaterial
+                ) {
+                  mat.envMapIntensity = 1.0;
+                }
+              }
+            }
+          }
+        });
+        return pivot;
+      }
+
+      // =========================================================================
+      // 4. Voice Dictation Hook (Web Speech API + Gemini Audio Fallback)
+      // =========================================================================
+      function getSpeechRecognitionConstructor() {
+        const w = window;
+        return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+      }
+
+      function useVoiceDictation({ language, onFinalTranscript }) {
+        const [isListening, setIsListening] = useState(false);
+        const [isTranscribing, setIsTranscribing] = useState(false);
+        const [interimText, setInterimText] = useState('');
+        const [audioLevel, setAudioLevel] = useState(0);
+        const [voiceError, setVoiceError] = useState(null);
+        const [engineMode, setEngineMode] = useState(() =>
+          getSpeechRecognitionConstructor() ? 'speech' : 'gemini-audio'
+        );
+
+        const onFinalRef = useRef(onFinalTranscript);
+        onFinalRef.current = onFinalTranscript;
+        const recognitionRef = useRef(null);
+        const mediaRecorderRef = useRef(null);
+        const mediaStreamRef = useRef(null);
+        const audioCtxRef = useRef(null);
+        const levelRafRef = useRef(0);
+        const chunksRef = useRef([]);
+        const finalBufferRef = useRef('');
+
+        const stopAudioMeter = useCallback(() => {
+          if (levelRafRef.current) cancelAnimationFrame(levelRafRef.current);
+          levelRafRef.current = 0;
+          if (audioCtxRef.current) {
+            audioCtxRef.current.close().catch(() => {});
+            audioCtxRef.current = null;
+          }
+          if (mediaStreamRef.current) {
+            mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+            mediaStreamRef.current = null;
+          }
+          setAudioLevel(0);
+        }, []);
+
+        const startAudioMeter = useCallback((stream) => {
+          try {
+            const ctx = new AudioContext();
+            const source = ctx.createMediaStreamSource(stream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 256;
+            source.connect(analyser);
+            audioCtxRef.current = ctx;
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            const tick = () => {
+              analyser.getByteFrequencyData(data);
+              let sum = 0;
+              for (let i = 0; i < data.length; i++) sum += data[i];
+              setAudioLevel(Math.min(1, sum / data.length / 128));
+              levelRafRef.current = requestAnimationFrame(tick);
+            };
+            tick();
+          } catch {}
+        }, []);
+
+        const startGeminiRecorder = useCallback(async () => {
+          setVoiceError(null);
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaStreamRef.current = stream;
+            startAudioMeter(stream);
+            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+              ? 'audio/webm;codecs=opus'
+              : MediaRecorder.isTypeSupported('audio/webm')
+                ? 'audio/webm'
+                : 'audio/mp4';
+            const recorder = new MediaRecorder(stream, { mimeType });
+            chunksRef.current = [];
+            recorder.ondataavailable = (e) => {
+              if (e.data.size > 0) chunksRef.current.push(e.data);
+            };
+            recorder.onstop = async () => {
+              stopAudioMeter();
+              const blob = new Blob(chunksRef.current, { type: mimeType });
+              chunksRef.current = [];
+              if (blob.size < 400) {
+                setIsListening(false);
+                return;
+              }
+              setIsTranscribing(true);
+              try {
+                const buffer = await blob.arrayBuffer();
+                const bytes = new Uint8Array(buffer);
+                let binary = '';
+                for (let i = 0; i < bytes.length; i += 0x8000) {
+                  binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+                }
+                const res = await fetch(`${API_BASE}/api/transcribe`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    audioBase64: btoa(binary),
+                    mimeType: mimeType.split(';')[0],
+                    language,
+                  }),
+                });
+                const json = await res.json();
+                if (!res.ok) throw new Error(json.error || '음성 인식 실패');
+                if (json.transcript) onFinalRef.current(json.transcript);
+                else setVoiceError('음성이 감지되지 않았습니다.');
+              } catch (err) {
+                setVoiceError(err instanceof Error ? err.message : '음성 인식 실패');
+              } finally {
+                setIsTranscribing(false);
+                setIsListening(false);
+              }
+            };
+            mediaRecorderRef.current = recorder;
+            recorder.start();
+            setIsListening(true);
+          } catch {
+            stopAudioMeter();
+            setIsListening(false);
+            setVoiceError('마이크 권한을 허용해 주세요.');
+          }
+        }, [language, startAudioMeter, stopAudioMeter]);
+
+        const stopListening = useCallback(() => {
+          if (recognitionRef.current) {
+            try {
+              recognitionRef.current.stop();
+            } catch {}
+            recognitionRef.current = null;
+          }
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop();
+            mediaRecorderRef.current = null;
+          } else {
+            stopAudioMeter();
+            setIsListening(false);
+          }
+        }, [stopAudioMeter]);
+
+        const startListening = useCallback(async () => {
+          setVoiceError(null);
+          setInterimText('');
+          finalBufferRef.current = '';
+          const SpeechCtor = getSpeechRecognitionConstructor();
+          if (engineMode === 'gemini-audio' || !SpeechCtor) {
+            await startGeminiRecorder();
+            return;
+          }
+          try {
+            if (navigator.mediaDevices?.getUserMedia) {
+              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              mediaStreamRef.current = stream;
+              startAudioMeter(stream);
+            }
+          } catch {
+            setVoiceError('마이크 접근 권한이 필요합니다.');
+            return;
+          }
+          const recognition = new SpeechCtor();
+          recognition.lang = language;
+          recognition.continuous = false;
+          recognition.interimResults = true;
+          recognition.onresult = (event) => {
+            let interim = '';
+            let finalChunk = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+              const res = event.results[i];
+              const text = res[0]?.transcript || '';
+              if (res.isFinal) finalChunk += text;
+              else interim += text;
+            }
+            if (finalChunk) finalBufferRef.current = `${finalBufferRef.current} ${finalChunk}`.trim();
+            setInterimText(`${finalBufferRef.current} ${interim}`.trim());
+          };
+          recognition.onerror = (ev) => {
+            if (ev.error === 'not-allowed' || ev.error === 'network') {
+              setEngineMode('gemini-audio');
+            }
+            setVoiceError(`음성 인식 오류 (${ev.error})`);
+            stopAudioMeter();
+            setIsListening(false);
+          };
+          recognition.onend = () => {
+            stopAudioMeter();
+            setIsListening(false);
+            recognitionRef.current = null;
+            const finalText = finalBufferRef.current.trim();
+            setInterimText('');
+            if (finalText) onFinalRef.current(finalText);
+          };
+          recognitionRef.current = recognition;
+          setIsListening(true);
+          recognition.start();
+        }, [engineMode, language, startAudioMeter, startGeminiRecorder, stopAudioMeter]);
+
+        const toggleListening = useCallback(() => {
+          if (isListening) stopListening();
+          else startListening();
+        }, [isListening, startListening, stopListening]);
+
+        useEffect(() => {
+          return () => {
+            if (recognitionRef.current) try { recognitionRef.current.abort(); } catch {}
+            if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+              mediaRecorderRef.current.stop();
+            }
+            stopAudioMeter();
+          };
+        }, [stopAudioMeter]);
+
+        return {
+          isListening,
+          isTranscribing,
+          interimText,
+          audioLevel,
+          voiceError,
+          engineMode,
+          setEngineMode,
+          toggleListening,
+        };
+      }
+
+      // =========================================================================
+      // 5. Three.js Studio Viewport Component
+      // =========================================================================
+      const _targetCamPos = new THREE.Vector3(4.2, 2.9, 4.6);
+      const _targetLookAt = new THREE.Vector3(0, 0.7, 0);
+      const _box = new THREE.Box3();
+      const _boxCenter = new THREE.Vector3();
+      const _boxSize = new THREE.Vector3();
+
+      function detectSoftwareWebGL() {
+        try {
+          const canvas = document.createElement('canvas');
+          const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+          if (!gl) return true;
+          const ext = gl.getExtension('WEBGL_debug_renderer_info');
+          const gpu = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
+          gl.getExtension('WEBGL_lose_context')?.loseContext();
+          return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+        } catch {
+          return true;
+        }
+      }
+
+      const StudioViewport = forwardRef(function StudioViewport(
+        { objects, selectedId, transformMode, showGrid, theme, onSelectObject, onCommitTransform, onDropFiles },
+        ref
+      ) {
+        const mountRef = useRef(null);
+        const [contextLost, setContextLost] = useState(false);
+        const [isDraggingFile, setIsDraggingFile] = useState(false);
+        const onSelectRef = useRef(onSelectObject);
+        onSelectRef.current = onSelectObject;
+        const onCommitTransformRef = useRef(onCommitTransform);
+        onCommitTransformRef.current = onCommitTransform;
+        const selectedIdRef = useRef(selectedId);
+        selectedIdRef.current = selectedId;
+        const engineRef = useRef(null);
+
+        useEffect(() => {
+          const container = mountRef.current;
+          if (!container) return;
+          const isSoftwareGl = detectSoftwareWebGL();
+          const renderer = new THREE.WebGLRenderer({
+            antialias: !isSoftwareGl,
+            powerPreference: 'high-performance',
+          });
+          const width = container.clientWidth || window.innerWidth;
+          const height = container.clientHeight || window.innerHeight;
+          renderer.outputColorSpace = THREE.SRGBColorSpace;
+          renderer.toneMapping = THREE.ACESFilmicToneMapping;
+          renderer.toneMappingExposure = 1.08;
+          renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
+          renderer.setSize(width, height);
+          renderer.shadowMap.enabled = !isSoftwareGl;
+          renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+          const canvas = renderer.domElement;
+          canvas.style.display = 'block';
+          canvas.style.width = '100%';
+          canvas.style.height = '100%';
+          container.appendChild(canvas);
+
+          const scene = new THREE.Scene();
+          const initBg = theme === 'dark' ? 0x10141c : 0xe9eef5;
+          scene.background = new THREE.Color(initBg);
+          scene.fog = new THREE.FogExp2(initBg, 0.022);
+
+          const pmremGenerator = new THREE.PMREMGenerator(renderer);
+          const envTex = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+          scene.environment = envTex;
+          pmremGenerator.dispose();
+
+          const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 150);
+          camera.position.set(4.2, 2.9, 4.6);
+
+          scene.add(new THREE.HemisphereLight(0xdbeafe, 0x334155, 0.65));
+          const keyLight = new THREE.DirectionalLight(0xfff5e8, 1.9);
+          keyLight.position.set(5.5, 8.5, 5.0);
+          if (!isSoftwareGl) {
+            keyLight.castShadow = true;
+            keyLight.shadow.mapSize.set(2048, 2048);
+            const d = 7;
+            keyLight.shadow.camera.left = -d;
+            keyLight.shadow.camera.right = d;
+            keyLight.shadow.camera.top = d;
+            keyLight.shadow.camera.bottom = -d;
+            keyLight.shadow.camera.near = 0.5;
+            keyLight.shadow.camera.far = 26;
+            keyLight.shadow.bias = -0.0005;
+            keyLight.shadow.normalBias = 0.02;
+          }
+          scene.add(keyLight);
+
+          const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.75);
+          rimLight.position.set(-5.5, 4.5, -6.0);
+          scene.add(rimLight);
+
+          if (!isSoftwareGl) {
+            RectAreaLightUniformsLib.init();
+            const softbox = new THREE.RectAreaLight(0xffffff, 2.4, 4, 2.5);
+            softbox.position.set(-4.5, 4.2, 2.5);
+            softbox.lookAt(0, 0.8, 0);
+            scene.add(softbox);
+          }
+
+          const floorGeo = new THREE.CircleGeometry(18, 64);
+          floorGeo.rotateX(-Math.PI / 2);
+          const floorMat = new THREE.MeshStandardMaterial({
+            color: theme === 'dark' ? 0x131822 : 0xe2e8f0,
+            roughness: 0.9,
+            metalness: 0.04,
+          });
+          const groundDisc = new THREE.Mesh(floorGeo, floorMat);
+          groundDisc.position.y = -0.004;
+          groundDisc.receiveShadow = !isSoftwareGl;
+          scene.add(groundDisc);
+
+          const contactGeo = new THREE.PlaneGeometry(5.5, 5.5);
+          contactGeo.rotateX(-Math.PI / 2);
+          const contactMat = new THREE.MeshBasicMaterial({
+            map: getContactShadowTexture(),
+            transparent: true,
+            opacity: 0.38,
+            depthWrite: false,
+          });
+          const contactPlane = new THREE.Mesh(contactGeo, contactMat);
+          contactPlane.position.y = -0.002;
+          scene.add(contactPlane);
+
+          const grid = new THREE.GridHelper(24, 24, 0x3b82f6, 0x334155);
+          grid.position.y = 0.001;
+          const gridMats = Array.isArray(grid.material) ? grid.material : [grid.material];
+          for (const gm of gridMats) {
+            gm.transparent = true;
+            gm.opacity = theme === 'dark' ? 0.35 : 0.45;
+            gm.polygonOffset = true;
+            gm.polygonOffsetFactor = -1;
+            gm.polygonOffsetUnits = -1;
+          }
+          scene.add(grid);
+
+          const modelRoot = new THREE.Group();
+          modelRoot.name = 'VocaCAD_ModelRoot';
+          scene.add(modelRoot);
+
+          const orbit = new OrbitControls(camera, canvas);
+          orbit.target.set(0, 0.7, 0);
+          orbit.enableDamping = !isSoftwareGl;
+          orbit.dampingFactor = 0.07;
+          orbit.maxPolarAngle = Math.PI / 2 - 0.03;
+          orbit.minDistance = 1.2;
+          orbit.maxDistance = 32;
+
+          const transform = new TransformControls(camera, canvas);
+          transform.setSize(0.78);
+          scene.add(transform.getHelper());
+
+          let frameId = 0;
+          let renderBusy = false;
+          let renderDirty = false;
+          let transitionActive = false;
+          let lastTime = performance.now();
+
+          function afterDraw(cb) {
+            const gl = renderer.getContext();
+            if (!gl || typeof gl.fenceSync !== 'function') {
+              frameId = window.setTimeout(cb, 80);
+              return;
+            }
+            const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+            gl.flush();
+            const poll = () => {
+              const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+              if (state === gl.UNSIGNALED) frameId = window.setTimeout(poll, 5);
+              else {
+                if (sync) gl.deleteSync(sync);
+                frameId = window.setTimeout(cb, 80);
+              }
+            };
+            frameId = window.setTimeout(poll, 5);
+          }
+
+          function requestRender() {
+            if (renderBusy) {
+              renderDirty = true;
+              return;
+            }
+            renderBusy = true;
+            frameId = requestAnimationFrame((now) => {
+              renderDirty = false;
+              const dt = Math.min((now - lastTime) / 1000, 0.1);
+              lastTime = now;
+              if (transitionActive) {
+                const lambda = 7.5;
+                camera.position.x = THREE.MathUtils.damp(camera.position.x, _targetCamPos.x, lambda, dt);
+                camera.position.y = THREE.MathUtils.damp(camera.position.y, _targetCamPos.y, lambda, dt);
+                camera.position.z = THREE.MathUtils.damp(camera.position.z, _targetCamPos.z, lambda, dt);
+                orbit.target.x = THREE.MathUtils.damp(orbit.target.x, _targetLookAt.x, lambda, dt);
+                orbit.target.y = THREE.MathUtils.damp(orbit.target.y, _targetLookAt.y, lambda, dt);
+                orbit.target.z = THREE.MathUtils.damp(orbit.target.z, _targetLookAt.z, lambda, dt);
+                if (
+                  camera.position.distanceTo(_targetCamPos) < 0.015 &&
+                  orbit.target.distanceTo(_targetLookAt) < 0.015
+                ) {
+                  camera.position.copy(_targetCamPos);
+                  orbit.target.copy(_targetLookAt);
+                  transitionActive = false;
+                } else {
+                  renderDirty = true;
+                }
+              }
+              orbit.update();
+              if (engineRef.current?.selectionHelper) engineRef.current.selectionHelper.update();
+              renderer.render(scene, camera);
+              const done = () => {
+                renderBusy = false;
+                if (renderDirty) requestRender();
+              };
+              if (isSoftwareGl) afterDraw(done);
+              else done();
+            });
+          }
+
+          function startCameraTransition(pos, lookAt) {
+            _targetCamPos.copy(pos);
+            _targetLookAt.copy(lookAt);
+            transitionActive = true;
+            lastTime = performance.now();
+            requestRender();
+          }
+
+          orbit.addEventListener('start', () => { transitionActive = false; });
+          orbit.addEventListener('change', requestRender);
+
+          transform.addEventListener('dragging-changed', (event) => {
+            orbit.enabled = !event.value;
+            if (!event.value && transform.object) {
+              const obj = transform.object;
+              const id = obj.userData.objectId;
+              if (id) {
+                onCommitTransformRef.current(
+                  id,
+                  [Number(obj.position.x.toFixed(3)), Number(obj.position.y.toFixed(3)), Number(obj.position.z.toFixed(3))],
+                  [Number((obj.rotation.x * RAD2DEG).toFixed(1)), Number((obj.rotation.y * RAD2DEG).toFixed(1)), Number((obj.rotation.z * RAD2DEG).toFixed(1))],
+                  [Number(obj.scale.x.toFixed(3)), Number(obj.scale.y.toFixed(3)), Number(obj.scale.z.toFixed(3))]
+                );
+              }
+            }
+            requestRender();
+          });
+
+          transform.addEventListener('change', () => {
+            if (engineRef.current?.selectionHelper) engineRef.current.selectionHelper.update();
+            requestRender();
+          });
+
+          const raycaster = new THREE.Raycaster();
+          const pointerDownPos = new THREE.Vector2();
+          const ndc = new THREE.Vector2();
+
+          const handlePointerDown = (e) => pointerDownPos.set(e.clientX, e.clientY);
+          const handlePointerUp = (e) => {
+            if (transform.dragging) return;
+            if (Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y) > 5) return;
+            const rect = canvas.getBoundingClientRect();
+            ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(ndc, camera);
+            const hits = raycaster.intersectObjects(modelRoot.children, true);
+            if (hits.length > 0) {
+              let curr = hits[0].object;
+              let foundId = null;
+              while (curr && curr !== modelRoot) {
+                if (typeof curr.userData.objectId === 'string') { foundId = curr.userData.objectId; break; }
+                if (typeof curr.userData.rootObjectId === 'string') { foundId = curr.userData.rootObjectId; break; }
+                curr = curr.parent;
+              }
+              onSelectRef.current(foundId);
+            } else {
+              onSelectRef.current(null);
+            }
+          };
+          canvas.addEventListener('pointerdown', handlePointerDown);
+          canvas.addEventListener('pointerup', handlePointerUp);
+
+          const handleContextLost = (e) => { e.preventDefault(); setContextLost(true); };
+          const handleContextRestored = () => { setContextLost(false); requestRender(); };
+          canvas.addEventListener('webglcontextlost', handleContextLost);
+          canvas.addEventListener('webglcontextrestored', handleContextRestored);
+
+          const handleResize = () => {
+            if (!container) return;
+            const w = container.clientWidth || window.innerWidth;
+            const h = container.clientHeight || window.innerHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+            requestRender();
+          };
+          window.addEventListener('resize', handleResize);
+
+          engineRef.current = {
+            scene,
+            camera,
+            renderer,
+            orbit,
+            transform,
+            modelRoot,
+            grid,
+            groundDisc,
+            selectionHelper: null,
+            objectMap: new Map(),
+            isSoftwareGl,
+            maxAnisotropy: Math.min(renderer.capabilities.getMaxAnisotropy() || 4, 8),
+            requestRender,
+            startCameraTransition,
+          };
+
+          if (!isSoftwareGl) renderer.compile(scene, camera);
+          requestRender();
+
+          return () => {
+            cancelAnimationFrame(frameId);
+            clearTimeout(frameId);
+            window.removeEventListener('resize', handleResize);
+            canvas.removeEventListener('pointerdown', handlePointerDown);
+            canvas.removeEventListener('pointerup', handlePointerUp);
+            canvas.removeEventListener('webglcontextlost', handleContextLost);
+            canvas.removeEventListener('webglcontextrestored', handleContextRestored);
+            transform.detach();
+            transform.dispose();
+            orbit.dispose();
+            modelRoot.children.forEach(disposeThreeObject);
+            floorGeo.dispose();
+            floorMat.dispose();
+            contactGeo.dispose();
+            contactMat.dispose();
+            envTex.dispose();
+            renderer.dispose();
+            if (canvas.parentNode === container) container.removeChild(canvas);
+            engineRef.current = null;
+          };
+        }, []);
+
+        useEffect(() => {
+          const eng = engineRef.current;
+          if (!eng) return;
+          let cancelled = false;
+          eng.transform.detach();
+          if (eng.selectionHelper) {
+            eng.scene.remove(eng.selectionHelper);
+            eng.selectionHelper.dispose();
+            eng.selectionHelper = null;
+          }
+          while (eng.modelRoot.children.length > 0) {
+            const child = eng.modelRoot.children[0];
+            eng.modelRoot.remove(child);
+            disposeThreeObject(child);
+          }
+          eng.objectMap.clear();
+
+          for (const spec of objects) {
+            const obj3d = buildSceneObject(spec, eng.isSoftwareGl, eng.maxAnisotropy);
+            eng.modelRoot.add(obj3d);
+            eng.objectMap.set(spec.id, obj3d);
+            if (spec.shape === 'imported' && spec.importedAssetId) {
+              getAssetRecord(spec.importedAssetId).then(async (asset) => {
+                if (cancelled || !asset) return;
+                const pivot = await parseImportedModel(
+                  asset.data,
+                  spec.importedFormat || asset.format,
+                  spec.id,
+                  eng.isSoftwareGl,
+                  eng.maxAnisotropy,
+                  spec.material,
+                  Boolean(spec.overrideImportedMaterial)
+                );
+                if (cancelled) { disposeThreeObject(pivot); return; }
+                obj3d.add(pivot);
+                if (selectedIdRef.current === spec.id) {
+                  if (eng.selectionHelper) eng.selectionHelper.update();
+                  else {
+                    const helper = new THREE.BoxHelper(obj3d, 0x38bdf8);
+                    eng.scene.add(helper);
+                    eng.selectionHelper = helper;
+                  }
+                }
+                eng.requestRender();
+              });
+            }
+          }
+
+          if (selectedId && eng.objectMap.has(selectedId)) {
+            const target = eng.objectMap.get(selectedId);
+            eng.transform.attach(target);
+            const helper = new THREE.BoxHelper(target, 0x38bdf8);
+            eng.scene.add(helper);
+            eng.selectionHelper = helper;
+          }
+          eng.requestRender();
+          return () => { cancelled = true; };
+        }, [objects, selectedId]);
+
+        useEffect(() => {
+          if (engineRef.current) {
+            engineRef.current.transform.setMode(transformMode);
+            engineRef.current.requestRender();
+          }
+        }, [transformMode]);
+
+        useEffect(() => {
+          if (engineRef.current) {
+            engineRef.current.grid.visible = showGrid;
+            engineRef.current.requestRender();
+          }
+        }, [showGrid]);
+
+        useEffect(() => {
+          const eng = engineRef.current;
+          if (!eng) return;
+          const bgHex = theme === 'dark' ? 0x10141c : 0xe9eef5;
+          eng.scene.background = new THREE.Color(bgHex);
+          if (eng.scene.fog) eng.scene.fog.color.setHex(bgHex);
+          eng.groundDisc.material.color.setHex(theme === 'dark' ? 0x131822 : 0xe2e8f0);
+          const gridMats = Array.isArray(eng.grid.material) ? eng.grid.material : [eng.grid.material];
+          for (const gm of gridMats) gm.opacity = theme === 'dark' ? 0.34 : 0.45;
+          eng.requestRender();
+        }, [theme]);
+
+        useImperativeHandle(ref, () => ({
+          setCameraPreset(preset) {
+            const eng = engineRef.current;
+            if (!eng) return;
+            const focusTarget =
+              preset === 'focus' && selectedIdRef.current
+                ? eng.objectMap.get(selectedIdRef.current) || eng.modelRoot
+                : eng.modelRoot;
+            if (focusTarget.children.length > 0 || focusTarget instanceof THREE.Mesh) {
+              _box.setFromObject(focusTarget);
+              _box.getCenter(_boxCenter);
+              _box.getSize(_boxSize);
+            } else {
+              _boxCenter.set(0, 0.7, 0);
+              _boxSize.set(2.5, 2.0, 2.5);
+            }
+            const radius = Math.max(_boxSize.length() * 0.9, 2.8);
+            if (preset === 'front') eng.startCameraTransition(new THREE.Vector3(_boxCenter.x, _boxCenter.y + 0.4, _boxCenter.z + radius * 1.45), _boxCenter.clone());
+            else if (preset === 'side') eng.startCameraTransition(new THREE.Vector3(_boxCenter.x + radius * 1.45, _boxCenter.y + 0.4, _boxCenter.z), _boxCenter.clone());
+            else if (preset === 'top') eng.startCameraTransition(new THREE.Vector3(_boxCenter.x, _boxCenter.y + radius * 1.65, _boxCenter.z + 0.05), _boxCenter.clone());
+            else if (preset === 'focus') eng.startCameraTransition(new THREE.Vector3(_boxCenter.x + radius * 0.95, _boxCenter.y + radius * 0.65, _boxCenter.z + radius * 1.05), _boxCenter.clone());
+            else eng.startCameraTransition(new THREE.Vector3(4.2, 2.9, 4.6), new THREE.Vector3(0, 0.7, 0));
+          },
+          exportGLB(fileName = 'vocacad-model.glb') {
+            const eng = engineRef.current;
+            if (!eng) return Promise.resolve();
+            const exporter = new GLTFExporter();
+            return new Promise((resolve, reject) => {
+              exporter.parse(
+                eng.modelRoot,
+                (result) => {
+                  const blob = result instanceof ArrayBuffer
+                    ? new Blob([result], { type: 'model/gltf-binary' })
+                    : new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = fileName;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  resolve();
+                },
+                reject,
+                { binary: true }
+              );
+            });
+          },
+          exportPNG(fileName = 'vocacad-render.png') {
+            const eng = engineRef.current;
+            if (!eng) return;
+            const prevH = eng.selectionHelper?.visible ?? false;
+            const prevT = eng.transform.getHelper().visible;
+            if (eng.selectionHelper) eng.selectionHelper.visible = false;
+            eng.transform.getHelper().visible = false;
+            eng.renderer.render(eng.scene, eng.camera);
+            const url = eng.renderer.domElement.toDataURL('image/png');
+            if (eng.selectionHelper) eng.selectionHelper.visible = prevH;
+            eng.transform.getHelper().visible = prevT;
+            eng.requestRender();
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            a.click();
+          },
+          captureThumbnail() {
+            const eng = engineRef.current;
+            if (!eng) return null;
+            const prevH = eng.selectionHelper?.visible ?? false;
+            const prevT = eng.transform.getHelper().visible;
+            if (eng.selectionHelper) eng.selectionHelper.visible = false;
+            eng.transform.getHelper().visible = false;
+            eng.renderer.render(eng.scene, eng.camera);
+            const thumbCanvas = document.createElement('canvas');
+            thumbCanvas.width = 480;
+            thumbCanvas.height = 300;
+            const ctx = thumbCanvas.getContext('2d');
+            const out = ctx ? (ctx.drawImage(eng.renderer.domElement, 0, 0, 480, 300), thumbCanvas.toDataURL('image/jpeg', 0.82)) : null;
+            if (eng.selectionHelper) eng.selectionHelper.visible = prevH;
+            eng.transform.getHelper().visible = prevT;
+            eng.requestRender();
+            return out;
+          },
+        }));
+
+        return html`
+          <div
+            className="relative w-full h-full overflow-hidden"
+            onDragOver=${(e) => {
+              if (e.dataTransfer?.types.includes('Files')) {
+                e.preventDefault();
+                setIsDraggingFile(true);
+              }
+            }}
+            onDragLeave=${() => setIsDraggingFile(false)}
+            onDrop=${(e) => {
+              e.preventDefault();
+              setIsDraggingFile(false);
+              if (e.dataTransfer?.files?.length && onDropFiles) onDropFiles(e.dataTransfer.files);
+            }}
+          >
+            <div ref=${mountRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+            ${isDraggingFile && html`
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/75 border-2 border-dashed border-sky-400 pointer-events-none">
+                <div className="px-6 py-4 rounded-xl bg-slate-900 border border-white/15 text-sm font-medium text-slate-100">
+                  GLB, GLTF, OBJ, STL 또는 프로젝트 JSON 파일을 놓아 장면에 추가하세요
+                </div>
+              </div>
+            `}
+            ${contextLost && html`
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/85 text-slate-100">
+                <div className="px-6 py-4 rounded-xl border border-white/15 bg-slate-900 text-sm">
+                  WebGL 그래픽 컨텍스트를 복구하는 중입니다...
+                </div>
+              </div>
+            `}
+          </div>
+        `;
+      });
+
+      // =========================================================================
+      // 6. StartScreen Component
+      // =========================================================================
+      function StartScreen({
+        projects,
+        theme,
+        isLoadingProjects,
+        uploadError,
+        onToggleTheme,
+        onStartEmpty,
+        onStartStarter,
+        onStartWithPrompt,
+        onOpenProject,
+        onDeleteProject,
+        onExportProjectJSON,
+        onUploadFiles,
+      }) {
+        const fileInputRef = useRef(null);
+        const [promptInput, setPromptInput] = useState('');
+        const [searchQuery, setSearchQuery] = useState('');
+        const [isDragActive, setIsDragActive] = useState(false);
+
+        const voice = useVoiceDictation({
+          language: 'ko-KR',
+          onFinalTranscript: (transcript) => {
+            setPromptInput(transcript);
+            onStartWithPrompt(transcript, 'voice');
+          },
+        });
+
+        const filteredProjects = projects.filter((p) => {
+          if (!searchQuery.trim()) return true;
+          const q = searchQuery.trim().toLowerCase();
+          return (
+            p.name.toLowerCase().includes(q) ||
+            (p.lastPrompt && p.lastPrompt.toLowerCase().includes(q))
+          );
+        });
+
+        return html`
+          <div className="w-screen h-screen overflow-y-auto bg-slate-50 dark:bg-[#0e1117] text-slate-900 dark:text-slate-100">
+            <header className="sticky top-0 z-20 h-14 px-6 flex items-center justify-between gap-8 border-b border-slate-200 dark:border-white/10 bg-white/95 dark:bg-[#12161f]/95">
+              <a href="#start" onClick=${(e) => e.preventDefault()} className="font-display text-lg font-bold tracking-tight whitespace-nowrap shrink-0">
+                VocaCAD
+              </a>
+              <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-300">
+                <button type="button" onClick=${onStartEmpty} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">빈 작업실</button>
+                <button type="button" onClick=${onStartStarter} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">예제 스튜디오</button>
+                <button type="button" onClick=${() => fileInputRef.current?.click()} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">3D 파일 불러오기</button>
+                <button type="button" onClick=${onToggleTheme} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">
+                  ${theme === 'dark' ? '라이트 모드' : '다크 모드'}
+                </button>
+              </nav>
+              <button
+                type="button"
+                onClick=${onStartStarter}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-sky-600 hover:bg-sky-500 text-white whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <${Plus} className="w-3.5 h-3.5" />
+                <span>새 모델링 시작</span>
+              </button>
+            </header>
+
+            <input
+              ref=${fileInputRef}
+              type="file"
+              multiple
+              accept=".glb,.gltf,.obj,.stl,.json"
+              className="hidden"
+              onChange=${(e) => {
+                if (e.target.files?.length) {
+                  onUploadFiles(e.target.files);
+                  e.target.value = '';
+                }
+              }}
+            />
+
+            <main className="max-w-6xl mx-auto px-6 py-10 space-y-12">
+              <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
+                <div className="lg:col-span-7 flex flex-col justify-between p-7 rounded-xl border border-slate-200 dark:border-white/10 bg-white dark:bg-[#141923]">
+                  <div className="space-y-3">
+                    <p className="text-xs font-medium text-sky-600 dark:text-sky-400">구술 기반 3D 공간 모델링 스튜디오</p>
+                    <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight leading-tight">
+                      말로 설명하면 바로 조립되는 3D 작업실
+                    </h1>
+                    <p className="text-sm sm:text-base text-slate-600 dark:text-slate-300 leading-relaxed max-w-2xl">
+                      마이크로 형태와 재질을 구술하거나 기존 3D 파일을 불러와 실시간으로 편집하고 GLB 파일로 내보낼 수 있습니다.
+                    </p>
+                  </div>
+
+                  <div className="mt-7 space-y-4">
+                    <form
+                      onSubmit=${(e) => {
+                        e.preventDefault();
+                        if (promptInput.trim()) onStartWithPrompt(promptInput.trim(), 'text');
+                      }}
+                      className="flex flex-col sm:flex-row gap-2.5"
+                    >
+                      <button
+                        type="button"
+                        onClick=${voice.toggleListening}
+                        disabled=${voice.isTranscribing}
+                        className=${`inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-xs font-semibold text-white whitespace-nowrap shrink-0 cursor-pointer ${
+                          voice.isListening ? 'bg-rose-600 hover:bg-rose-500' : 'bg-sky-600 hover:bg-sky-500'
+                        }`}
+                      >
+                        <${voice.isListening ? MicOff : Mic} className="w-4 h-4" />
+                        <span>${voice.isListening ? '듣는 중 · 중지' : voice.isTranscribing ? '변환 중...' : '음성으로 시작'}</span>
+                      </button>
+
+                      <input
+                        type="text"
+                        value=${voice.isListening && voice.interimText ? voice.interimText : promptInput}
+                        onChange=${(e) => setPromptInput(e.target.value)}
+                        placeholder="만들고 싶은 3D 모델을 입력하세요 (예: 원목 테이블과 유리 머그컵)"
+                        className="flex-1 min-w-0 px-3.5 py-3 rounded-lg border border-slate-200 dark:border-white/12 bg-slate-50 dark:bg-[#0e1218] text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+
+                      <button
+                        type="submit"
+                        disabled=${!promptInput.trim()}
+                        className="inline-flex items-center justify-center gap-1.5 px-5 py-3 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold disabled:opacity-35 whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        <${Sparkles} className="w-3.5 h-3.5" />
+                        <span>생성하기</span>
+                      </button>
+                    </form>
+
+                    ${voice.voiceError && html`<p className="text-xs text-rose-500">${voice.voiceError}</p>`}
+
+                    <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+                      <button type="button" onClick=${onStartEmpty} className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-200 dark:border-white/12 hover:border-sky-500/60 hover:bg-sky-500/10 font-medium cursor-pointer">
+                        <${Plus} className="w-3.5 h-3.5" />
+                        <span>빈 작업실 열기</span>
+                      </button>
+                      <button type="button" onClick=${onStartStarter} className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-200 dark:border-white/12 hover:border-sky-500/60 hover:bg-sky-500/10 font-medium cursor-pointer">
+                        <${Box} className="w-3.5 h-3.5" />
+                        <span>스튜디오 예제로 시작</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  onDragOver=${(e) => { e.preventDefault(); setIsDragActive(true); }}
+                  onDragLeave=${() => setIsDragActive(false)}
+                  onDrop=${(e) => {
+                    e.preventDefault();
+                    setIsDragActive(false);
+                    if (e.dataTransfer?.files?.length) onUploadFiles(e.dataTransfer.files);
+                  }}
+                  className=${`lg:col-span-5 flex flex-col justify-between p-7 rounded-xl border transition-colors ${
+                    isDragActive
+                      ? 'border-sky-500 bg-sky-500/10'
+                      : 'border-dashed border-slate-300 dark:border-white/20 bg-white dark:bg-[#141923]'
+                  }`}
+                >
+                  <div className="space-y-2.5">
+                    <div className="w-10 h-10 rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-400 flex items-center justify-center">
+                      <${Upload} className="w-5 h-5" />
+                    </div>
+                    <h2 className="font-display text-lg font-semibold">3D 모델 · 프로젝트 파일 업로드</h2>
+                    <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
+                      기존 3D 파일이나 저장해 둔 작업 파일을 끌어다 놓거나 선택하면 바로 뷰포트에서 구술로 위치·크기·재질을 수정할 수 있습니다.
+                    </p>
+                    <div className="text-xs text-slate-500 dark:text-slate-400 pt-1">
+                      지원 형식: GLB · GLTF · OBJ · STL · VocaCAD JSON
+                    </div>
+                  </div>
+
+                  <div className="mt-6 space-y-2.5">
+                    ${uploadError && html`<p className="text-xs text-rose-500">${uploadError}</p>`}
+                    <button
+                      type="button"
+                      onClick=${() => fileInputRef.current?.click()}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg border border-slate-300 dark:border-white/15 bg-slate-50 dark:bg-[#1b2230] hover:border-sky-500/60 hover:bg-sky-500/10 text-xs font-semibold cursor-pointer"
+                    >
+                      <${FolderOpen} className="w-4 h-4" />
+                      <span>컴퓨터에서 파일 선택하기</span>
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <section className="space-y-5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 dark:border-white/10 pb-4">
+                  <div>
+                    <h2 className="font-display text-xl font-semibold">이전에 만든 파일 히스토리</h2>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                      작업한 3D 장면과 업로드한 모델이 브라우저에 자동 저장됩니다 · 총 ${projects.length}개
+                    </p>
+                  </div>
+                  ${projects.length > 0 && html`
+                    <div className="relative w-full sm:w-64">
+                      <${Search} className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value=${searchQuery}
+                        onChange=${(e) => setSearchQuery(e.target.value)}
+                        placeholder="프로젝트 이름 또는 명령 검색"
+                        className="w-full pl-8 pr-3 py-2 rounded-lg border border-slate-200 dark:border-white/12 bg-white dark:bg-[#141923] text-xs focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
+                  `}
+                </div>
+
+                ${isLoadingProjects
+                  ? html`<div className="py-12 text-center text-sm text-slate-500">불러오는 중...</div>`
+                  : filteredProjects.length === 0
+                    ? html`
+                      <div className="py-14 px-6 rounded-xl border border-slate-200 dark:border-white/10 bg-white dark:bg-[#141923] text-center space-y-2">
+                        <p className="text-sm font-medium">아직 저장된 작업 히스토리가 없습니다</p>
+                        <p className="text-xs text-slate-500">새 모델링을 시작하거나 3D 파일을 업로드하면 이곳에 자동 기록됩니다.</p>
+                      </div>
+                    `
+                    : html`
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                        ${filteredProjects.map((project) => html`
+                          <article key=${project.id} className="group rounded-xl border border-slate-200 dark:border-white/10 bg-white dark:bg-[#141923] overflow-hidden flex flex-col hover:border-sky-500/50">
+                            <button type="button" onClick=${() => onOpenProject(project)} className="relative aspect-[16/10] w-full bg-slate-100 dark:bg-[#0c1017] overflow-hidden cursor-pointer">
+                              ${project.thumbnailDataUrl
+                                ? html`<img src=${project.thumbnailDataUrl} alt=${project.name} className="w-full h-full object-cover" />`
+                                : html`<div className="w-full h-full flex items-center justify-center text-slate-500"><${Box} className="w-8 h-8" /></div>`}
+                            </button>
+                            <div className="p-4 flex-1 flex flex-col justify-between gap-3">
+                              <div className="space-y-1">
+                                <h3 className="text-sm font-semibold truncate">${project.name}</h3>
+                                <div className="flex items-center gap-2 text-xs text-slate-500 font-mono-tabular">
+                                  <span>오브젝트 ${project.objectCount}개</span>
+                                  <span>·</span>
+                                  <span className="truncate">${new Date(project.updatedAt).toLocaleString('ko-KR')}</span>
+                                </div>
+                              </div>
+                              <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-white/8">
+                                <button type="button" onClick=${() => onOpenProject(project)} className="px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium cursor-pointer">열기</button>
+                                <div className="flex items-center gap-1">
+                                  <button type="button" onClick=${() => onExportProjectJSON(project)} className="p-1.5 rounded-md text-slate-400 hover:text-white hover:bg-white/10 cursor-pointer"><${Download} className="w-3.5 h-3.5" /></button>
+                                  <button type="button" onClick=${() => onDeleteProject(project.id)} className="p-1.5 rounded-md text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 cursor-pointer"><${Trash2} className="w-3.5 h-3.5" /></button>
+                                </div>
+                              </div>
+                            </div>
+                          </article>
+                        `)}
+                      </div>
+                    `}
+              </section>
+            </main>
+          </div>
+        `;
+      }
+
+      // =========================================================================
+      // 7. TopBar & BottomControlDock
+      // =========================================================================
+      function TopBar({ canUndo, showGrid, theme, objectCount, isExporting, onGoHome, onUploadFiles, onUndo, onToggleGrid, onToggleTheme, onExportGLB }) {
+        const fileInputRef = useRef(null);
+        return html`
+          <header className="fixed top-0 inset-x-0 z-20 h-14 px-6 flex items-center justify-between gap-8 border-b border-slate-200 dark:border-white/10 bg-white/95 dark:bg-[#12161f]/95 text-slate-900 dark:text-slate-100">
+            <input
+              ref=${fileInputRef}
+              type="file"
+              multiple
+              accept=".glb,.gltf,.obj,.stl,.json"
+              className="hidden"
+              onChange=${(e) => {
+                if (e.target.files?.length) {
+                  onUploadFiles(e.target.files);
+                  e.target.value = '';
+                }
+              }}
+            />
+            <a href="#home" onClick=${(e) => { e.preventDefault(); onGoHome(); }} className="font-display text-lg font-bold tracking-tight whitespace-nowrap shrink-0">
+              VocaCAD
+            </a>
+            <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-300">
+              <button type="button" onClick=${onGoHome} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">시작 화면</button>
+              <button type="button" onClick=${() => fileInputRef.current?.click()} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">파일 업로드</button>
+              <button type="button" onClick=${onUndo} disabled=${!canUndo} className="whitespace-nowrap hover:underline underline-offset-4 disabled:opacity-35 cursor-pointer">실행 취소</button>
+              <button type="button" onClick=${onToggleGrid} className=${`whitespace-nowrap hover:underline underline-offset-4 cursor-pointer ${showGrid ? 'text-sky-600 dark:text-sky-400' : ''}`}>
+                ${showGrid ? '그리드 켜짐' : '그리드 꺼짐'}
+              </button>
+              <button type="button" onClick=${onToggleTheme} className="whitespace-nowrap hover:underline underline-offset-4 cursor-pointer">
+                ${theme === 'dark' ? '라이트 스튜디오' : '다크 스튜디오'}
+              </button>
+            </nav>
+            <button
+              type="button"
+              onClick=${onExportGLB}
+              disabled=${objectCount === 0 || isExporting}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-40 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <${Download} className="w-3.5 h-3.5" />
+              <span>${isExporting ? '내보내는 중...' : 'GLB 내보내기'}</span>
+            </button>
+          </header>
+        `;
+      }
+
+      const FINISH_OPTIONS = [
+        ['matte', '무광'],
+        ['satin', '새틴'],
+        ['glossy', '유광'],
+        ['ceramic', '세라믹'],
+        ['metallic', '금속'],
+        ['brushed_metal', '브러시드 메탈'],
+        ['glass', '유리'],
+        ['wood', '원목'],
+        ['emissive', '발광'],
+      ];
+      const SWATCHES = ['#f8fafc', '#334155', '#2563eb', '#0d9488', '#dc2626', '#d97706', '#d4af37', '#a47148'];
+      const STARTER_PROMPTS = [
+        { label: '로켓 조립', prompt: '현재 물체를 모두 지우고 흰색과 빨간색 포인트가 있는 3단 우주 로켓을 만들어줘' },
+        { label: '테이블과 머그컵', prompt: '모두 지우고 원목 다이닝 테이블을 만든 뒤 그 위에 손잡이 달린 파란 세라믹 머그컵을 올려줘' },
+        { label: '유리 화병 추가', prompt: '오른쪽 x=1.6 위치에 투명한 에메랄드 유리 꽃병을 하나 추가해줘' },
+        { label: '황동 재질 & 확대', prompt: '선택한 물체를 브러시드 골드 금속으로 바꾸고 크기를 1.35배 키워줘' },
+      ];
+
+      function BottomControlDock(props) {
+        const [activeTab, setActiveTab] = useState('prompts');
+        const {
+          collapsed, onToggleCollapsed, commandText, onChangeCommandText, onSubmitCommand,
+          isProcessing, lastReply, lastError, language, onToggleLanguage,
+          isListening, isTranscribing, interimText, audioLevel, voiceError,
+          voiceEngineMode, onToggleVoiceEngine, onToggleListening,
+          objects, selectedObject, onSelectObject, onDeleteObject, onDuplicateObject,
+          onToggleVisibility, onUpdateSelected, projectName, onChangeProjectName,
+          canRedo, onRedo, onCapturePNG, onSaveProjectJSON, onResetScene,
+          transformMode, onChangeTransformMode, onCameraPreset, history,
+        } = props;
+
+        return html`
+          <div className=${`fixed bottom-4 left-1/2 -translate-x-1/2 z-20 w-[min(940px,95vw)] transition-transform duration-200 ${collapsed ? 'translate-y-[calc(100%-34px)]' : 'translate-y-0'}`}>
+            <div className="flex justify-center mb-1.5">
+              <button type="button" onClick=${onToggleCollapsed} className="inline-flex items-center gap-1.5 px-3.5 py-1 rounded-t-lg border border-b-0 border-slate-200 dark:border-white/15 bg-white/95 dark:bg-[#161b24]/95 text-xs font-medium text-slate-600 dark:text-slate-300 cursor-pointer">
+                <${collapsed ? ChevronUp : ChevronDown} className="w-3.5 h-3.5" />
+                <span>${collapsed ? '컨트롤 열기 (H)' : '컨트롤 숨기기 (H)'}</span>
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 dark:border-white/15 bg-white/95 dark:bg-[#151a23]/95 shadow-2xl text-slate-900 dark:text-slate-100 overflow-hidden">
+              <div className="p-3.5 border-b border-slate-200 dark:border-white/10">
+                <form
+                  onSubmit=${(e) => {
+                    e.preventDefault();
+                    if (commandText.trim() && !isProcessing) onSubmitCommand(commandText.trim(), 'text');
+                  }}
+                  className="flex items-center gap-2.5"
+                >
+                  <button
+                    type="button"
+                    onClick=${onToggleListening}
+                    disabled=${isProcessing || isTranscribing}
+                    className=${`inline-flex items-center gap-2 px-3.5 py-2.5 rounded-lg text-xs font-semibold text-white whitespace-nowrap shrink-0 cursor-pointer ${
+                      isListening ? 'bg-rose-600 hover:bg-rose-500' : 'bg-sky-600 hover:bg-sky-500'
+                    }`}
+                  >
+                    <${isListening ? MicOff : Mic} className="w-4 h-4" />
+                    <span>${isListening ? '듣는 중 · 중지' : isTranscribing ? '변환 중...' : '구술 시작'}</span>
+                  </button>
+
+                  ${isListening && html`
+                    <div className="flex items-end gap-0.5 h-6 px-1.5 shrink-0">
+                      ${[0.25, 0.45, 0.7, 0.5, 0.3].map((w, idx) => html`
+                        <span key=${idx} style=${{ height: `${Math.min(22, Math.max(4, Math.round(audioLevel * 22 * w + 4)))}px` }} className="w-1 rounded-sm bg-rose-500" />
+                      `)}
+                    </div>
+                  `}
+
+                  <input
+                    type="text"
+                    value=${isListening && interimText ? interimText : commandText}
+                    onChange=${(e) => onChangeCommandText(e.target.value)}
+                    placeholder="구술하거나 명령을 입력하세요 (예: 원목 의자와 유리 컵 만들어줘)"
+                    disabled=${isProcessing || isTranscribing}
+                    className="flex-1 min-w-0 px-3.5 py-2.5 rounded-lg border border-slate-200 dark:border-white/12 bg-slate-50 dark:bg-[#0e1218] text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+
+                  <button type="submit" disabled=${!commandText.trim() || isProcessing || isListening} className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-semibold disabled:opacity-35 whitespace-nowrap shrink-0 cursor-pointer">
+                    <${Send} className="w-3.5 h-3.5" />
+                    <span>${isProcessing ? '생성 중...' : '모델링'}</span>
+                  </button>
+                </form>
+
+                <div className="mt-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+                  <div className="flex-1 min-w-0 truncate">
+                    ${lastError || voiceError
+                      ? html`<span className="text-rose-500 font-medium">오류: ${lastError || voiceError}</span>`
+                      : isProcessing
+                        ? html`<span className="text-sky-500 font-medium">3D 형상과 재질을 설계하는 중...</span>`
+                        : html`<span className="text-slate-500 dark:text-slate-300">${lastReply || '마이크로 말하거나 텍스트로 지시해 보세요.'}</span>`}
+                  </div>
+                  <div className="flex items-center gap-3 text-slate-400 shrink-0">
+                    <button type="button" onClick=${onToggleLanguage} className="cursor-pointer hover:text-white">언어: ${language === 'ko-KR' ? '한국어' : 'English'}</button>
+                    <span>·</span>
+                    <button type="button" onClick=${onToggleVoiceEngine} className="cursor-pointer hover:text-white">음성: ${voiceEngineMode === 'speech' ? '실시간 구술' : 'Gemini 녹음'}</button>
+                    <span>·</span>
+                    <span className="font-mono-tabular">오브젝트 ${objects.length}개</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="px-3.5 py-2 flex items-center justify-between gap-4 border-b border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-[#11151d]">
+                <div className="flex items-center gap-1 p-0.5 rounded-lg bg-slate-200/70 dark:bg-white/5">
+                  ${[
+                    ['prompts', '구술 예제'],
+                    ['objects', `장면 목록 (${objects.length})`],
+                    ['inspector', '선택 속성'],
+                    ['view', '카메라 · 기록'],
+                  ].map(([id, label]) => html`
+                    <button
+                      key=${id}
+                      type="button"
+                      onClick=${() => setActiveTab(id)}
+                      className=${`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap cursor-pointer ${
+                        activeTab === id ? 'bg-white dark:bg-[#1e2532] text-slate-950 dark:text-white shadow-sm' : 'text-slate-500 hover:text-white'
+                      }`}
+                    >
+                      ${label}
+                    </button>
+                  `)}
+                </div>
+                <div className="hidden sm:flex items-center gap-1 p-0.5 rounded-lg bg-slate-200/70 dark:bg-white/5">
+                  ${[
+                    ['translate', Move, '이동'],
+                    ['rotate', RotateCw, '회전'],
+                    ['scale', Maximize2, '크기'],
+                  ].map(([mode, Icon, label]) => html`
+                    <button
+                      key=${mode}
+                      type="button"
+                      onClick=${() => onChangeTransformMode(mode)}
+                      className=${`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md cursor-pointer ${
+                        transformMode === mode ? 'bg-white dark:bg-[#1e2532] text-sky-500 shadow-sm' : 'text-slate-500 hover:text-white'
+                      }`}
+                    >
+                      <${Icon} className="w-3.5 h-3.5" />
+                      <span>${label}</span>
+                    </button>
+                  `)}
+                </div>
+              </div>
+
+              <div className="p-3.5 max-h-48 overflow-y-auto dock-scroll">
+                ${activeTab === 'prompts' && html`
+                  <div className="flex flex-wrap gap-2">
+                    ${STARTER_PROMPTS.map((item) => html`
+                      <button
+                        key=${item.label}
+                        type="button"
+                        disabled=${isProcessing}
+                        onClick=${() => onSubmitCommand(item.prompt, 'preset')}
+                        className="text-left px-3 py-2 rounded-lg border border-slate-200 dark:border-white/10 hover:border-sky-500/60 hover:bg-sky-500/10 cursor-pointer"
+                      >
+                        <div className="text-xs font-semibold">${item.label}</div>
+                        <div className="text-[11px] text-slate-400 truncate max-w-[240px]">${item.prompt}</div>
+                      </button>
+                    `)}
+                  </div>
+                `}
+
+                ${activeTab === 'objects' && html`
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    ${objects.map((obj) => html`
+                      <div key=${obj.id} className=${`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border ${selectedObject?.id === obj.id ? 'border-sky-500 bg-sky-500/10' : 'border-slate-200 dark:border-white/10'}`}>
+                        <button type="button" onClick=${() => onSelectObject(obj.id)} className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer">
+                          <span className="w-3 h-3 rounded-sm shrink-0" style=${{ backgroundColor: obj.material.color }} />
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium truncate">${obj.name}</div>
+                            <div className="text-[11px] text-slate-400 font-mono-tabular">
+                              ${obj.shape === 'group' ? `${obj.parts?.length ?? 0}파트` : obj.shape === 'imported' ? `${(obj.importedFormat || '3d').toUpperCase()} 파일` : obj.shape}
+                            </div>
+                          </div>
+                        </button>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button type="button" onClick=${() => onToggleVisibility(obj.id)} className="p-1 text-slate-400 hover:text-white cursor-pointer"><${obj.visible === false ? EyeOff : Eye} className="w-3.5 h-3.5" /></button>
+                          <button type="button" onClick=${() => onDuplicateObject(obj.id)} className="p-1 text-slate-400 hover:text-white cursor-pointer"><${Copy} className="w-3.5 h-3.5" /></button>
+                          <button type="button" onClick=${() => onDeleteObject(obj.id)} className="p-1 text-slate-400 hover:text-rose-500 cursor-pointer"><${Trash2} className="w-3.5 h-3.5" /></button>
+                        </div>
+                      </div>
+                    `)}
+                  </div>
+                `}
+
+                ${activeTab === 'inspector' && (selectedObject ? html`
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold">위치 (X, Y, Z)</span>
+                        <button type="button" onClick=${() => onUpdateSelected({ snapToGround: true })} className="text-sky-500 hover:underline cursor-pointer">바닥 정렬</button>
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        ${['X', 'Y', 'Z'].map((axis, idx) => html`
+                          <input key=${axis} type="number" step="0.1" value=${selectedObject.position[idx]} onChange=${(e) => {
+                            const next = [...selectedObject.position];
+                            next[idx] = Number(e.target.value) || 0;
+                            onUpdateSelected({ position: next });
+                          }} className="w-full px-2 py-1 rounded border border-slate-200 dark:border-white/12 bg-slate-50 dark:bg-[#0e1218] font-mono-tabular" />
+                        `)}
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <span className="font-semibold block">회전 (°) 및 배율</span>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        ${['RX', 'RY', 'RZ'].map((axis, idx) => html`
+                          <input key=${axis} type="number" step="15" value=${selectedObject.rotationDeg[idx]} onChange=${(e) => {
+                            const next = [...selectedObject.rotationDeg];
+                            next[idx] = Number(e.target.value) || 0;
+                            onUpdateSelected({ rotationDeg: next });
+                          }} className="w-full px-2 py-1 rounded border border-slate-200 dark:border-white/12 bg-slate-50 dark:bg-[#0e1218] font-mono-tabular" />
+                        `)}
+                      </div>
+                      <input type="range" min="0.2" max="3" step="0.05" value=${selectedObject.scale[0]} onChange=${(e) => {
+                        const s = Number(e.target.value);
+                        onUpdateSelected({ scale: [s, s, s] });
+                      }} className="w-full accent-sky-500" />
+                    </div>
+                    <div className="space-y-2">
+                      <span className="font-semibold block">재질 및 색상</span>
+                      <div className="flex gap-2">
+                        <select value=${selectedObject.material.finish} onChange=${(e) => onUpdateSelected({ finish: e.target.value })} className="flex-1 px-2 py-1.5 rounded border border-slate-200 dark:border-white/12 bg-slate-50 dark:bg-[#0e1218]">
+                          ${FINISH_OPTIONS.map(([val, lbl]) => html`<option key=${val} value=${val}>${lbl}</option>`)}
+                        </select>
+                        <input type="color" value=${selectedObject.material.color} onChange=${(e) => onUpdateSelected({ color: e.target.value })} className="w-8 h-7 rounded cursor-pointer" />
+                      </div>
+                      <div className="flex gap-1.5">
+                        ${SWATCHES.map((hex) => html`<button key=${hex} type="button" onClick=${() => onUpdateSelected({ color: hex })} style=${{ backgroundColor: hex }} className="w-5 h-5 rounded border border-black/20 cursor-pointer" />`)}
+                      </div>
+                    </div>
+                  </div>
+                ` : html`<p className="text-xs text-slate-400">물체를 선택하면 속성을 편집할 수 있습니다.</p>`)}
+
+                ${activeTab === 'view' && html`
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold">프로젝트 및 카메라</span>
+                        <input type="text" value=${projectName} onChange=${(e) => onChangeProjectName(e.target.value)} className="w-44 px-2 py-1 rounded border border-slate-200 dark:border-white/12 bg-slate-50 dark:bg-[#0e1218]" />
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        ${[['iso', '등각'], ['front', '정면'], ['side', '측면'], ['top', '상단'], ['focus', '선택 맞춤']].map(([p, l]) => html`
+                          <button key=${p} type="button" onClick=${() => onCameraPreset(p)} className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-white/12 hover:border-sky-500/60 cursor-pointer">${l}</button>
+                        `)}
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        <button type="button" onClick=${onRedo} disabled=${!canRedo} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/12 disabled:opacity-35 cursor-pointer">다시 실행</button>
+                        <button type="button" onClick=${onCapturePNG} disabled=${objects.length === 0} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/12 disabled:opacity-35 cursor-pointer">렌더 PNG</button>
+                        <button type="button" onClick=${onSaveProjectJSON} disabled=${objects.length === 0} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/12 disabled:opacity-35 cursor-pointer">프로젝트 JSON 저장</button>
+                        <button type="button" onClick=${onResetScene} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/12 hover:text-rose-500 cursor-pointer">장면 비우기</button>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <div className="font-semibold">최근 구술 기록</div>
+                      ${history.slice(0, 4).map((item) => html`
+                        <div key=${item.id} className="flex justify-between text-[11px] border-b border-white/5 pb-1">
+                          <span className="truncate">"${item.transcript}"</span>
+                          <span className="font-mono-tabular text-slate-400 shrink-0">${item.timestamp}</span>
+                        </div>
+                      `)}
+                    </div>
+                  </div>
+                `}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // =========================================================================
+      // 8. Main App
+      // =========================================================================
+      const generateId = (prefix = 'obj') => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      const cloneObjects = (list) => JSON.parse(JSON.stringify(list));
+
+      function App() {
+        const viewportRef = useRef(null);
+        const [viewMode, setViewMode] = useState('start');
+        const [projects, setProjects] = useState([]);
+        const [isLoadingProjects, setIsLoadingProjects] = useState(true);
+        const [uploadError, setUploadError] = useState(null);
+
+        const [activeProjectId, setActiveProjectId] = useState(() => generateId('proj'));
+        const [projectName, setProjectName] = useState('새 3D 프로젝트');
+        const [projectCreatedAt, setProjectCreatedAt] = useState(() => Date.now());
+        const [objects, setObjects] = useState(() => createStarterSceneObjects());
+        const [selectedId, setSelectedId] = useState('obj_lamp_starter');
+        const [undoStack, setUndoStack] = useState([]);
+        const [redoStack, setRedoStack] = useState([]);
+
+        const [transformMode, setTransformMode] = useState('translate');
+        const [showGrid, setShowGrid] = useState(true);
+        const [theme, setTheme] = useState('dark');
+        const [dockCollapsed, setDockCollapsed] = useState(false);
+
+        const [commandText, setCommandText] = useState('');
+        const [isProcessing, setIsProcessing] = useState(false);
+        const [isExporting, setIsExporting] = useState(false);
+        const [lastReply, setLastReply] = useState('스튜디오가 준비되었습니다.');
+        const [lastError, setLastError] = useState(null);
+        const [language, setLanguage] = useState('ko-KR');
+        const [history, setHistory] = useState([]);
+
+        useEffect(() => {
+          listProjects().then((loaded) => {
+            setProjects(loaded);
+            setIsLoadingProjects(false);
+          });
+        }, []);
+
+        useEffect(() => {
+          document.documentElement.classList.toggle('dark', theme === 'dark');
+        }, [theme]);
+
+        const selectedObject = useMemo(() => objects.find((o) => o.id === selectedId) ?? null, [objects, selectedId]);
+
+        const persistCurrentProject = useCallback(async (captureThumb = true) => {
+          if (objects.length === 0 && history.length === 0) return;
+          const thumb = captureThumb ? viewportRef.current?.captureThumbnail() ?? undefined : undefined;
+          await saveStoredProject({
+            id: activeProjectId,
+            name: projectName.trim() || '제목 없는 3D 프로젝트',
+            createdAt: projectCreatedAt,
+            updatedAt: Date.now(),
+            objectCount: objects.length,
+            lastPrompt: history[0]?.transcript,
+            thumbnailDataUrl: thumb,
+            objects: cloneObjects(objects),
+            history: [...history],
+          });
+          setProjects(await listProjects());
+        }, [activeProjectId, history, objects, projectCreatedAt, projectName]);
+
+        useEffect(() => {
+          if (viewMode !== 'studio') return;
+          if (objects.length === 0 && history.length === 0) return;
+          const t = setTimeout(() => { persistCurrentProject(true).catch(() => {}); }, 900);
+          return () => clearTimeout(t);
+        }, [viewMode, objects, projectName, history, persistCurrentProject]);
+
+        const pushHistorySnapshot = useCallback((snapshot) => {
+          setUndoStack((prev) => [...prev.slice(-24), cloneObjects(snapshot)]);
+          setRedoStack([]);
+        }, []);
+
+        const handleUndo = useCallback(() => {
+          setUndoStack((prev) => {
+            if (!prev.length) return prev;
+            const previous = prev[prev.length - 1];
+            setRedoStack((r) => [...r, cloneObjects(objects)]);
+            setObjects(previous);
+            return prev.slice(0, -1);
+          });
+        }, [objects]);
+
+        const handleRedo = useCallback(() => {
+          setRedoStack((prev) => {
+            if (!prev.length) return prev;
+            const next = prev[prev.length - 1];
+            setUndoStack((u) => [...u, cloneObjects(objects)]);
+            setObjects(next);
+            return prev.slice(0, -1);
+          });
+        }, [objects]);
+
+        const applyOperations = useCallback((ops, baseObjects, baseSelectedId) => {
+          const currentObjects = baseObjects ?? objects;
+          let nextObjects = cloneObjects(currentObjects);
+          let nextSelectedId = baseSelectedId !== undefined ? baseSelectedId : selectedId;
+          let pendingCamera = null;
+
+          for (const op of ops) {
+            if (op.type === 'delete') {
+              if (op.targetId === 'all') { nextObjects = []; nextSelectedId = null; }
+              else { nextObjects = nextObjects.filter((o) => o.id !== op.targetId); }
+            } else if (op.type === 'add') {
+              const newId = op.object.id || generateId('model');
+              nextObjects.push({ position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: [1, 1, 1], ...op.object, id: newId });
+              nextSelectedId = newId;
+            } else if (op.type === 'update') {
+              const idx = nextObjects.findIndex((o) => o.id === op.targetId);
+              if (idx === -1) continue;
+              const target = { ...nextObjects[idx] };
+              if (op.name) target.name = op.name;
+              if (op.position) target.position = op.position;
+              if (op.deltaPosition) target.position = [target.position[0] + op.deltaPosition[0], target.position[1] + op.deltaPosition[1], target.position[2] + op.deltaPosition[2]];
+              if (op.rotationDeg) target.rotationDeg = op.rotationDeg;
+              if (op.deltaRotationDeg) target.rotationDeg = [target.rotationDeg[0] + op.deltaRotationDeg[0], target.rotationDeg[1] + op.deltaRotationDeg[1], target.rotationDeg[2] + op.deltaRotationDeg[2]];
+              if (op.scale) target.scale = op.scale;
+              if (typeof op.scaleMultiplier === 'number') {
+                const m = Math.max(0.05, op.scaleMultiplier);
+                target.scale = [target.scale[0] * m, target.scale[1] * m, target.scale[2] * m];
+              }
+              if (op.material) {
+                target.material = { ...target.material, ...op.material };
+                if (target.shape === 'imported') target.overrideImportedMaterial = true;
+                if (target.shape === 'group' && Array.isArray(target.parts)) {
+                  target.parts = target.parts.map((p) => ({ ...p, material: { ...p.material, ...op.material } }));
+                }
+              }
+              nextObjects[idx] = target;
+              nextSelectedId = target.id;
+            } else if (op.type === 'duplicate') {
+              const src = nextObjects.find((o) => o.id === op.targetId);
+              if (!src) continue;
+              const count = Math.min(Math.max(op.count ?? 1, 1), 20);
+              const off = op.offset ?? [1.5, 0, 0];
+              for (let i = 1; i <= count; i++) {
+                const copy = cloneObjects([src])[0];
+                copy.id = generateId('dup');
+                copy.name = op.newName || `${src.name} (${i})`;
+                copy.position = [src.position[0] + off[0] * i, src.position[1] + off[1] * i, src.position[2] + off[2] * i];
+                nextObjects.push(copy);
+                nextSelectedId = copy.id;
+              }
+            } else if (op.type === 'select') nextSelectedId = op.targetId;
+            else if (op.type === 'camera') pendingCamera = op.preset;
+          }
+
+          pushHistorySnapshot(currentObjects);
+          setObjects(nextObjects);
+          setSelectedId(nextSelectedId);
+          if (pendingCamera) setTimeout(() => viewportRef.current?.setCameraPreset(pendingCamera), 40);
+        }, [objects, pushHistorySnapshot, selectedId]);
+
+        const runModelingCommand = useCallback(async (rawText, source, overrideObjects, overrideSelectedId) => {
+          const instruction = rawText.trim();
+          if (!instruction || isProcessing) return;
+          const activeObjects = overrideObjects ?? objects;
+          const activeSelId = overrideSelectedId !== undefined ? overrideSelectedId : selectedId;
+          setIsProcessing(true);
+          setLastError(null);
+          if (source !== 'preset') setCommandText('');
+
+          const sceneSummary = activeObjects.map((o) => ({
+            id: o.id, name: o.name, shape: o.shape, position: o.position,
+            rotationDeg: o.rotationDeg, scale: o.scale, color: o.material.color,
+            finish: o.material.finish, partCount: o.parts?.length ?? 1,
+          }));
+
+          try {
+            const res = await fetch(`${API_BASE}/api/model-command`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ instruction, sceneSummary, selectedId: activeSelId }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || '3D 모델링 요청 처리에 실패했습니다.');
+            if (Array.isArray(data.operations) && data.operations.length > 0) {
+              applyOperations(data.operations, activeObjects, activeSelId);
+            }
+            setLastReply(data.reply || '모델을 업데이트했습니다.');
+            setHistory((prev) => [{
+              id: generateId('hist'),
+              timestamp: new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }),
+              transcript: instruction,
+              reply: data.reply,
+              operationCount: data.operations?.length ?? 0,
+              source,
+            }, ...prev.slice(0, 19)]);
+          } catch (err) {
+            setLastError(err instanceof Error ? err.message : '요청 오류가 발생했습니다.');
+          } finally {
+            setIsProcessing(false);
+          }
+        }, [applyOperations, isProcessing, objects, selectedId]);
+
+        const voice = useVoiceDictation({
+          language,
+          onFinalTranscript: (t) => {
+            setCommandText(t);
+            runModelingCommand(t, 'voice');
+          },
+        });
+
+        const handleUploadFiles = useCallback(async (fileList) => {
+          setUploadError(null);
+          setLastError(null);
+          const files = Array.from(fileList);
+          const addedSpecs = [];
+          try {
+            for (const file of files) {
+              const ext = file.name.toLowerCase().split('.').pop();
+              if (ext === 'json') {
+                const parsed = JSON.parse(await file.text());
+                if (!Array.isArray(parsed.objects)) throw new Error('유효한 프로젝트 JSON이 아닙니다.');
+                setActiveProjectId(generateId('proj'));
+                setProjectName(parsed.name || file.name.replace(/\.json$/i, ''));
+                setProjectCreatedAt(Date.now());
+                setObjects(parsed.objects);
+                setSelectedId(parsed.objects[0]?.id ?? null);
+                setHistory(parsed.history || []);
+                setViewMode('studio');
+                setTimeout(() => viewportRef.current?.setCameraPreset('focus'), 120);
+                return;
+              }
+              if (['glb', 'gltf', 'obj', 'stl'].includes(ext)) {
+                const buffer = await file.arrayBuffer();
+                const assetId = generateId('asset');
+                await saveAssetRecord({ id: assetId, fileName: file.name, format: ext, data: buffer, createdAt: Date.now() });
+                addedSpecs.push({
+                  id: generateId('imp'),
+                  name: file.name.replace(/\.(glb|gltf|obj|stl)$/i, ''),
+                  shape: 'imported',
+                  importedAssetId: assetId,
+                  importedFormat: ext,
+                  overrideImportedMaterial: false,
+                  position: [addedSpecs.length * 1.6, 0, 0],
+                  rotationDeg: [0, 0, 0],
+                  scale: [1, 1, 1],
+                  material: { color: '#94a3b8', finish: 'satin' },
+                  visible: true,
+                });
+              } else {
+                throw new Error(`지원하지 않는 형식입니다: ${file.name}`);
+              }
+            }
+            if (addedSpecs.length > 0) {
+              if (viewMode === 'start') {
+                setActiveProjectId(generateId('proj'));
+                setProjectName(addedSpecs[0].name);
+                setProjectCreatedAt(Date.now());
+                setObjects(addedSpecs);
+                setSelectedId(addedSpecs[addedSpecs.length - 1].id);
+                setHistory([]);
+                setViewMode('studio');
+              } else {
+                pushHistorySnapshot(objects);
+                setObjects((prev) => [...prev, ...addedSpecs]);
+                setSelectedId(addedSpecs[addedSpecs.length - 1].id);
+              }
+              setTimeout(() => viewportRef.current?.setCameraPreset('focus'), 150);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : '파일 업로드 오류';
+            if (viewMode === 'start') setUploadError(msg);
+            else setLastError(msg);
+          }
+        }, [objects, pushHistorySnapshot, viewMode]);
+
+        if (viewMode === 'start') {
+          return html`<${StartScreen}
+            projects=${projects}
+            theme=${theme}
+            isLoadingProjects=${isLoadingProjects}
+            uploadError=${uploadError}
+            onToggleTheme=${() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+            onStartEmpty=${() => {
+              setActiveProjectId(generateId('proj'));
+              setProjectName('새 3D 작업실');
+              setProjectCreatedAt(Date.now());
+              setObjects([]);
+              setSelectedId(null);
+              setHistory([]);
+              setViewMode('studio');
+            }}
+            onStartStarter=${() => {
+              const starter = createStarterSceneObjects();
+              setActiveProjectId(generateId('proj'));
+              setProjectName('스튜디오 데스크 램프 & 화병');
+              setProjectCreatedAt(Date.now());
+              setObjects(starter);
+              setSelectedId(starter[0].id);
+              setHistory([]);
+              setViewMode('studio');
+            }}
+            onStartWithPrompt=${(prompt, source) => {
+              setActiveProjectId(generateId('proj'));
+              setProjectName(prompt.slice(0, 22));
+              setProjectCreatedAt(Date.now());
+              setObjects([]);
+              setSelectedId(null);
+              setHistory([]);
+              setViewMode('studio');
+              runModelingCommand(prompt, source, [], null);
+            }}
+            onOpenProject=${(p) => {
+              setActiveProjectId(p.id);
+              setProjectName(p.name);
+              setProjectCreatedAt(p.createdAt);
+              const cloned = cloneObjects(p.objects || []);
+              setObjects(cloned);
+              setSelectedId(cloned[0]?.id ?? null);
+              setHistory(p.history || []);
+              setViewMode('studio');
+              setTimeout(() => viewportRef.current?.setCameraPreset('iso'), 60);
+            }}
+            onDeleteProject=${async (id) => {
+              await deleteStoredProject(id);
+              setProjects(await listProjects());
+            }}
+            onExportProjectJSON=${(p) => {
+              const blob = new Blob([JSON.stringify({ app: 'VocaCAD Studio', version: 1, ...p }, null, 2)], { type: 'application/json' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `${p.name.replace(/\s+/g, '_')}.vocacad.json`;
+              a.click();
+              URL.revokeObjectURL(url);
+            }}
+            onUploadFiles=${handleUploadFiles}
+          />`;
+        }
+
+        return html`
+          <div className="relative w-screen h-screen overflow-hidden bg-[#10141c]">
+            <${TopBar}
+              canUndo=${undoStack.length > 0}
+              showGrid=${showGrid}
+              theme=${theme}
+              objectCount=${objects.length}
+              isExporting=${isExporting}
+              onGoHome=${async () => { await persistCurrentProject(true); setViewMode('start'); }}
+              onUploadFiles=${handleUploadFiles}
+              onUndo=${handleUndo}
+              onToggleGrid=${() => setShowGrid((g) => !g)}
+              onToggleTheme=${() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+              onExportGLB=${async () => {
+                setIsExporting(true);
+                try { await viewportRef.current?.exportGLB(`${projectName || 'vocacad-model'}.glb`); }
+                finally { setIsExporting(false); }
+              }}
+            />
+            <main className="w-full h-full pt-14">
+              <${StudioViewport}
+                ref=${viewportRef}
+                objects=${objects}
+                selectedId=${selectedId}
+                transformMode=${transformMode}
+                showGrid=${showGrid}
+                theme=${theme}
+                onSelectObject=${setSelectedId}
+                onCommitTransform=${(id, pos, rot, scl) => {
+                  pushHistorySnapshot(objects);
+                  setObjects((prev) => prev.map((o) => (o.id === id ? { ...o, position: pos, rotationDeg: rot, scale: scl } : o)));
+                }}
+                onDropFiles=${handleUploadFiles}
+              />
+            </main>
+            <${BottomControlDock}
+              collapsed=${dockCollapsed}
+              onToggleCollapsed=${() => setDockCollapsed((c) => !c)}
+              commandText=${commandText}
+              onChangeCommandText=${setCommandText}
+              onSubmitCommand=${runModelingCommand}
+              isProcessing=${isProcessing}
+              lastReply=${lastReply}
+              lastError=${lastError}
+              language=${language}
+              onToggleLanguage=${() => setLanguage((l) => (l === 'ko-KR' ? 'en-US' : 'ko-KR'))}
+              isListening=${voice.isListening}
+              isTranscribing=${voice.isTranscribing}
+              interimText=${voice.interimText}
+              audioLevel=${voice.audioLevel}
+              voiceError=${voice.voiceError}
+              voiceEngineMode=${voice.engineMode}
+              onToggleVoiceEngine=${() => voice.setEngineMode(voice.engineMode === 'speech' ? 'gemini-audio' : 'speech')}
+              onToggleListening=${voice.toggleListening}
+              objects=${objects}
+              selectedObject=${selectedObject}
+              onSelectObject=${(id) => {
+                setSelectedId(id);
+                if (id) setTimeout(() => viewportRef.current?.setCameraPreset('focus'), 30);
+              }}
+              onDeleteObject=${(id) => {
+                pushHistorySnapshot(objects);
+                setObjects((prev) => prev.filter((o) => o.id !== id));
+              }}
+              onDuplicateObject=${(id) => {
+                const src = objects.find((o) => o.id === id);
+                if (!src) return;
+                pushHistorySnapshot(objects);
+                const copy = cloneObjects([src])[0];
+                copy.id = generateId('dup');
+                copy.name = `${src.name} 복제`;
+                copy.position = [src.position[0] + 1.2, src.position[1], src.position[2]];
+                setObjects((prev) => [...prev, copy]);
+                setSelectedId(copy.id);
+              }}
+              onToggleVisibility=${(id) => {
+                pushHistorySnapshot(objects);
+                setObjects((prev) => prev.map((o) => (o.id === id ? { ...o, visible: o.visible === false } : o)));
+              }}
+              onUpdateSelected=${(patch) => {
+                if (!selectedId) return;
+                pushHistorySnapshot(objects);
+                setObjects((prev) => prev.map((o) => {
+                  if (o.id !== selectedId) return o;
+                  const nextMat = { ...o.material, ...(patch.color ? { color: patch.color } : {}), ...(patch.finish ? { finish: patch.finish } : {}) };
+                  return {
+                    ...o,
+                    ...(patch.position ? { position: patch.position } : {}),
+                    ...(patch.rotationDeg ? { rotationDeg: patch.rotationDeg } : {}),
+                    ...(patch.scale ? { scale: patch.scale } : {}),
+                    ...(o.shape === 'imported' && (patch.color || patch.finish) ? { overrideImportedMaterial: true } : {}),
+                    material: nextMat,
+                  };
+                }));
+              }}
+              projectName=${projectName}
+              onChangeProjectName=${setProjectName}
+              canRedo=${redoStack.length > 0}
+              onRedo=${handleRedo}
+              onCapturePNG=${() => viewportRef.current?.exportPNG('vocacad-render.png')}
+              onSaveProjectJSON=${() => {
+                const blob = new Blob([JSON.stringify({ app: 'VocaCAD Studio', version: 1, name: projectName, objects, history }, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${projectName.replace(/\s+/g, '_')}.vocacad.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              onResetScene=${() => {
+                pushHistorySnapshot(objects);
+                setObjects([]);
+                setSelectedId(null);
+              }}
+              transformMode=${transformMode}
+              onChangeTransformMode=${setTransformMode}
+              onCameraPreset=${(p) => viewportRef.current?.setCameraPreset(p)}
+              history=${history}
+            />
+          </div>
+        `;
+      }
+
+      createRoot(document.getElementById('root')).render(html`<${App} />`);
+    </script>
+  </body>
+</html>
